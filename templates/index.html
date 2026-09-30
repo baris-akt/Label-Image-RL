@@ -12,8 +12,16 @@
       <details>
         <summary>File</summary>
         <div class="menu">
-          <button id="browseImages" type="button">Browse Images</button>
-          <button id="browseLabels" type="button">Browse Annotations</button>
+          <label>Images folder<input id="dirImages" placeholder="paste folder path" /></label>
+          <div class="inline">
+            <button id="browseImages" type="button">Browse</button>
+            <button id="applyImagesDir" type="button">Set</button>
+          </div>
+          <label>Annotations folder<input id="dirLabels" placeholder="paste folder path" /></label>
+          <div class="inline">
+            <button id="browseLabels" type="button">Browse</button>
+            <button id="applyLabelsDir" type="button">Set</button>
+          </div>
         </div>
       </details>
       <details>
@@ -173,6 +181,6 @@
       <button id="modalOk">OK</button>
     </div>
   </div>
-  <script src="/static/js/app.js?v=19"></script>
+  <script src="/static/js/app.js?v=20"></script>
 </body>
 </html>

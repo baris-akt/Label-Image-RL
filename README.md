@@ -2,29 +2,42 @@
 
 Web app for viewing and editing **YOLO** bounding boxes. It has a single-image editor and a crop browser so you can scan boxes across a dataset, filter by class or size, and fix labels in place.
 
+Works on **Windows** and **Ubuntu** (desktop).
+
 ## Requirements
 
 - Python 3.10+ (3.11 recommended)
 - A local browser
-- On Windows, folder browse uses Tkinter (included with the official Python installer)
+- Folder **Browse** uses Tk:
+  - Windows: included with the official Python installer
+  - Ubuntu: `sudo apt install python3-tk`
+- You can also paste a folder path in **File** and press **Set** (no Tk needed)
 
-Install:
+## Install
 
-```bash
+**Windows**
+
+```bat
+python -m venv .venv
+.venv\Scripts\activate
 pip install -r requirements.txt
+python app.py
 ```
 
-## Run
-
-From the project root:
+**Ubuntu**
 
 ```bash
-python app.py
+sudo apt update
+sudo apt install python3 python3-venv python3-pip python3-tk
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+python3 app.py
 ```
 
 Open [http://127.0.0.1:5050](http://127.0.0.1:5050).
 
-Point **File → Browse Images** at the image folder and **File → Browse Annotations** at the YOLO `.txt` folder (`classes.txt` is read from there if present). Last folders are remembered locally and are not committed.
+Point **File** at the image folder and the YOLO `.txt` folder (`classes.txt` is read from there if present). Last folders are remembered locally and are not committed.
 
 ## Dataset layout
 

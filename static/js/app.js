@@ -63,6 +63,10 @@ function applyState(st, keepView) {
     (st.clustering ? "  |  " + st.cluster_msg : (st.dataset_clustered ? "  |  clusters=" + st.cluster_count : ""));
   document.getElementById("statusImg").textContent = "images: " + (st.images_dir || "");
   document.getElementById("statusLab").textContent = "labels: " + (st.labels_dir || "");
+  const di = document.getElementById("dirImages");
+  const dl = document.getElementById("dirLabels");
+  if (di && document.activeElement !== di) di.value = st.images_dir || "";
+  if (dl && document.activeElement !== dl) dl.value = st.labels_dir || "";
   updateMultiBoxWarn();
   loadImages(keepView);
 }
@@ -572,6 +576,11 @@ document.getElementById("delBtn").onclick = () => {
   if (confirm("Delete this image and its label file?")) post("/api/delete").then(applyState);
 };
 document.getElementById("statsBtn").onclick = () => api("/api/stats").then((j) => showModal(j.text));
+function applyDir(kind, path) {
+  post("/api/set_dir", { kind, path })
+    .then((st) => { applyState(st); if (st.track_info) showModal(st.track_info.message); })
+    .catch((err) => showModal(err.message || String(err)));
+}
 document.getElementById("browseImages").onclick = () => {
   post("/api/browse", { kind: "images" })
     .then((st) => { applyState(st); if (st.track_info) showModal(st.track_info.message); })
@@ -582,6 +591,10 @@ document.getElementById("browseLabels").onclick = () => {
     .then((st) => { applyState(st); if (st.track_info) showModal(st.track_info.message); })
     .catch((err) => showModal(err.message || String(err)));
 };
+document.getElementById("applyImagesDir").onclick = () => applyDir("images", document.getElementById("dirImages").value);
+document.getElementById("applyLabelsDir").onclick = () => applyDir("labels", document.getElementById("dirLabels").value);
+document.getElementById("dirImages").addEventListener("keydown", (e) => { if (e.key === "Enter") document.getElementById("applyImagesDir").click(); });
+document.getElementById("dirLabels").addEventListener("keydown", (e) => { if (e.key === "Enter") document.getElementById("applyLabelsDir").click(); });
 function saveSettings() {
   post("/api/settings", {
     box_thickness: +document.getElementById("boxTh").value,
@@ -994,6 +1007,8 @@ window.addEventListener("resize", () => { if (img) fit(); });
   });
   document.getElementById("browseImages").addEventListener("click", () => closeMenus(null));
   document.getElementById("browseLabels").addEventListener("click", () => closeMenus(null));
+  document.getElementById("applyImagesDir").addEventListener("click", () => closeMenus(null));
+  document.getElementById("applyLabelsDir").addEventListener("click", () => closeMenus(null));
   document.getElementById("setClasses").addEventListener("click", () => closeMenus(null));
 })();
 

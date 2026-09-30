@@ -1,13 +1,18 @@
+#!/usr/bin/env python3
 """YOLO label web app. Combined viewer + crop search + change tracking.
 
     python app.py
+    python3 app.py
 
-Browse folders in the UI (File > Browse Images / Browse Annotations).
+Browse folders in the UI (File > Browse Images / Browse Annotations),
+or paste a folder path and press Set.
 """
 import os
 import io
+import sys
 import json
 import threading
+import subprocess
 import colorsys
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
@@ -305,6 +310,13 @@ def current_path():
 
 def load_bgr(path):
     img = cv2.imread(path, cv2.IMREAD_COLOR)
+    if img is None:
+        try:
+            with Image.open(path) as im:
+                rgb = np.array(im.convert("RGB"))
+                img = rgb[:, :, ::-1].copy()
+        except Exception:
+            img = None
     if img is None:
         return np.zeros((480, 640, 3), np.uint8)
     return img
@@ -636,6 +648,28 @@ def api_image():
     return send_file(encode_jpg(bgr), mimetype="image/jpeg")
 
 
+def apply_folder(kind, d):
+    global IMAGES_DIR, LABELS_DIR
+    if kind == "images":
+        IMAGES_DIR = d
+        save_last_folders()
+        reload_images()
+    else:
+        LABELS_DIR = d
+        save_last_folders()
+        load_classes_from_dir(LABELS_DIR)
+        if image_list or all_image_list:
+            apply_class_filter(current_path())
+        else:
+            reload_images()
+    msg = None
+    if tracking_enabled:
+        msg = load_or_create_tracking()
+    out = state_payload()
+    out["track_info"] = msg
+    return out
+
+
 @app.route("/api/folders", methods=["POST"])
 def api_folders():
     global IMAGES_DIR, LABELS_DIR
@@ -658,42 +692,56 @@ def api_folders():
 
 @app.route("/api/browse", methods=["POST"])
 def api_browse():
-    global IMAGES_DIR, LABELS_DIR
     kind = (request.get_json(force=True) or {}).get("kind")
+    initial = IMAGES_DIR if kind == "images" else LABELS_DIR
+    if not initial or not os.path.isdir(initial):
+        initial = os.path.expanduser("~")
+    title = "Select images folder" if kind == "images" else "Select annotations folder"
+    env = os.environ.copy()
+    env["LI_INITIAL"] = initial
+    env["LI_TITLE"] = title
+    code = (
+        "import os,sys\n"
+        "import tkinter as tk\n"
+        "from tkinter import filedialog\n"
+        "root=tk.Tk(); root.withdraw()\n"
+        "try:\n"
+        " root.attributes('-topmost', True)\n"
+        "except Exception:\n"
+        " pass\n"
+        "root.update()\n"
+        "d=filedialog.askdirectory(initialdir=os.environ.get('LI_INITIAL') or os.path.expanduser('~'),"
+        " title=os.environ.get('LI_TITLE') or 'Select folder')\n"
+        "root.destroy()\n"
+        "sys.stdout.buffer.write((d or '').encode('utf-8'))\n"
+    )
+    kw = {}
+    if os.name == "nt":
+        kw["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     try:
-        import tkinter as tk
-        from tkinter import filedialog
-        root = tk.Tk()
-        root.withdraw()
-        root.attributes("-topmost", True)
-        initial = IMAGES_DIR if kind == "images" else LABELS_DIR
-        if not initial or not os.path.isdir(initial):
-            initial = os.path.expanduser("~")
-        title = "Select images folder" if kind == "images" else "Select annotations folder"
-        d = filedialog.askdirectory(parent=root, initialdir=initial, title=title)
-        root.destroy()
+        r = subprocess.run([sys.executable, "-c", code], capture_output=True, env=env, timeout=600, **kw)
     except Exception as e:
         return jsonify({"error": "Browse failed: %s" % e}), 500
+    if r.returncode != 0:
+        err = (r.stderr or b"").decode("utf-8", errors="replace").strip()
+        hint = " On Ubuntu install: sudo apt install python3-tk"
+        return jsonify({"error": "Browse failed (needs Tk).%s %s" % (hint, err)}), 500
+    d = (r.stdout or b"").decode("utf-8", errors="replace").strip()
     if not d:
         return jsonify(state_payload())
-    if kind == "images":
-        IMAGES_DIR = d
-        save_last_folders()
-        reload_images()
-    else:
-        LABELS_DIR = d
-        save_last_folders()
-        load_classes_from_dir(LABELS_DIR)
-        if image_list or all_image_list:
-            apply_class_filter(current_path())
-        else:
-            reload_images()
-    msg = None
-    if tracking_enabled:
-        msg = load_or_create_tracking()
-    out = state_payload()
-    out["track_info"] = msg
-    return jsonify(out)
+    return jsonify(apply_folder(kind, d))
+
+
+@app.route("/api/set_dir", methods=["POST"])
+def api_set_dir():
+    data = request.get_json(force=True) or {}
+    kind = data.get("kind")
+    path = (data.get("path") or "").strip().strip('"').strip("'")
+    if kind not in ("images", "labels"):
+        return jsonify({"error": "Invalid folder kind"}), 400
+    if not path or not os.path.isdir(path):
+        return jsonify({"error": "Folder not found: %s" % path}), 400
+    return jsonify(apply_folder(kind, os.path.abspath(path)))
 
 
 @app.route("/api/goto", methods=["POST"])
