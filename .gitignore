@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+
+# Runtime / local machine state
+data/last_folders.txt
+data/tracking_cache/
+last_folders.txt
+tracking_cache/
+
+# Models / large binaries
+*.pt
+*.pth
+*.onnx
+*.weights
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
