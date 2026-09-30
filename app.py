@@ -690,13 +690,27 @@ def api_folders():
     return jsonify(out)
 
 
-@app.route("/api/browse", methods=["POST"])
-def api_browse():
-    kind = (request.get_json(force=True) or {}).get("kind")
-    initial = IMAGES_DIR if kind == "images" else LABELS_DIR
+def pick_directory(title, initial):
     if not initial or not os.path.isdir(initial):
         initial = os.path.expanduser("~")
-    title = "Select images folder" if kind == "images" else "Select annotations folder"
+    if os.name != "nt":
+        cmds = [
+            ["zenity", "--file-selection", "--directory", "--title", title, "--filename", initial.rstrip("/") + "/"],
+            ["kdialog", "--getexistingdirectory", initial, title],
+        ]
+        for args in cmds:
+            try:
+                r = subprocess.run(args, capture_output=True, timeout=600)
+            except FileNotFoundError:
+                continue
+            except Exception:
+                continue
+            if r.returncode == 0:
+                return (r.stdout or b"").decode("utf-8", "replace").strip()
+            err = (r.stderr or b"").decode("utf-8", "replace")
+            if r.returncode in (1, 5) and not err.strip():
+                return ""
+            continue
     env = os.environ.copy()
     env["LI_INITIAL"] = initial
     env["LI_TITLE"] = title
@@ -720,13 +734,32 @@ def api_browse():
         kw["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     try:
         r = subprocess.run([sys.executable, "-c", code], capture_output=True, env=env, timeout=600, **kw)
+    except Exception:
+        return None
+    if r.returncode == 0:
+        return (r.stdout or b"").decode("utf-8", "replace").strip()
+    err = (r.stderr or b"").decode("utf-8", "replace")
+    if "tkinter" in err.lower():
+        return None
+    return ""
+
+
+@app.route("/api/browse", methods=["POST"])
+def api_browse():
+    kind = (request.get_json(force=True) or {}).get("kind")
+    initial = IMAGES_DIR if kind == "images" else LABELS_DIR
+    if not initial or not os.path.isdir(initial):
+        initial = os.path.expanduser("~")
+    title = "Select images folder" if kind == "images" else "Select annotations folder"
+    try:
+        d = pick_directory(title, initial)
     except Exception as e:
         return jsonify({"error": "Browse failed: %s" % e}), 500
-    if r.returncode != 0:
-        err = (r.stderr or b"").decode("utf-8", errors="replace").strip()
-        hint = " On Ubuntu install: sudo apt install python3-tk"
-        return jsonify({"error": "Browse failed (needs Tk).%s %s" % (hint, err)}), 500
-    d = (r.stdout or b"").decode("utf-8", errors="replace").strip()
+    if d is None:
+        return jsonify({
+            "error": "No folder picker available. Paste the folder path in File and press Set. "
+            "On Ubuntu you can also: sudo apt install zenity   or   sudo apt install python3-tk"
+        }), 500
     if not d:
         return jsonify(state_payload())
     return jsonify(apply_folder(kind, d))

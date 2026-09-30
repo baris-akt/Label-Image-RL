@@ -8,10 +8,10 @@ Works on **Windows** and **Ubuntu** (desktop).
 
 - Python 3.10+ (3.11 recommended)
 - A local browser
-- Folder **Browse** uses Tk:
-  - Windows: included with the official Python installer
-  - Ubuntu: `sudo apt install python3-tk`
-- You can also paste a folder path in **File** and press **Set** (no Tk needed)
+- Folder **Browse**:
+  - Windows: Tk folder dialog (included with official Python)
+  - Ubuntu: **zenity** first (usually already installed on desktop), then Tk if present
+  - Always available: paste the folder path in **File** and press **Set** (no extra packages)
 
 ## Install
 
@@ -28,7 +28,7 @@ python app.py
 
 ```bash
 sudo apt update
-sudo apt install python3 python3-venv python3-pip python3-tk
+sudo apt install python3 python3-venv python3-pip zenity
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
