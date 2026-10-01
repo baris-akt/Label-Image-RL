@@ -123,8 +123,9 @@ function loadImages(keepView) {
   a.onload = () => {
     img = a; imgW = S.img_w; imgH = S.img_h;
     dual = selFilter ? (imgW >= imgH ? "v" : "h") : null;
-    if (document.getElementById("cropFocus").checked) focusFirstBox();
-    else if (keepView) draw();
+    // Crop Focus only on navigate (next/prev), not after box edits (keepView)
+    if (keepView) draw();
+    else if (document.getElementById("cropFocus").checked) focusFirstBox();
     else fit();
   };
   a.src = src;
@@ -961,6 +962,10 @@ window.addEventListener("keydown", (e) => {
   if (k === "arrowright" || k === "d") {
     if (popupOpen()) return;
     e.preventDefault(); document.getElementById("nextBtn").click();
+  }
+  if (k === "delete") {
+    if (popupOpen()) return;
+    e.preventDefault(); document.getElementById("delBtn").click();
   }
 });
 
