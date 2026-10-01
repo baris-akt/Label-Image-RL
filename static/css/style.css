@@ -266,11 +266,15 @@ body.light .stage { background: #ddd; }
 .filter-panel {
   position: absolute;
   top: 8px; right: 8px;
-  background: rgba(30,30,30,.88);
-  border: 1px solid #666;
+  background: rgba(30,30,30,.32);
+  border: 1px solid rgba(102,102,102,.45);
   border-radius: 4px;
   padding: 6px 8px;
   width: max-content;
+}
+body.light .filter-panel {
+  background: rgba(255,255,255,.32);
+  border-color: rgba(0,0,0,.2);
 }
 .filter-panel label { margin-right: 8px; }
 .status {

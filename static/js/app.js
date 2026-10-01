@@ -123,8 +123,8 @@ function loadImages(keepView) {
   a.onload = () => {
     img = a; imgW = S.img_w; imgH = S.img_h;
     dual = selFilter ? (imgW >= imgH ? "v" : "h") : null;
-    if (keepView) draw();
-    else if (document.getElementById("cropFocus").checked) focusFirstBox();
+    if (document.getElementById("cropFocus").checked) focusFirstBox();
+    else if (keepView) draw();
     else fit();
   };
   a.src = src;
@@ -152,10 +152,14 @@ function fit() {
 function focusFirstBox() {
   if (!img || !S || !(S.boxes || []).length) { fit(); return; }
   const [x1, y1, x2, y2] = xyxy(S.boxes[0]);
-  const bw = Math.max(8, x2 - x1), bh = Math.max(8, y2 - y1);
+  // with post-process dual view, include the same box on both images
+  let fx1 = x1, fy1 = y1, fx2 = x2, fy2 = y2;
+  if (dual === "h") fx2 = x2 + imgW + DUAL_GAP;
+  if (dual === "v") fy2 = y2 + imgH + DUAL_GAP;
+  const bw = Math.max(8, fx2 - fx1), bh = Math.max(8, fy2 - fy1);
   const level = Math.max(1, Math.min(10, +document.getElementById("cropFocusLevel").value || 5));
   // level 5 ≈ previous default (margin 3.2, max ~3.5× fit)
-  const margin = 5.5 - 0.46 * level;
+  const margin = dual ? (1.25 + 0.04 * (11 - level)) : (5.5 - 0.46 * level);
   const minMul = 1.05 + 0.03 * level;
   const maxMul = 1.2 + 0.46 * level;
   const r = cv.getBoundingClientRect();
@@ -163,8 +167,9 @@ function focusFirstBox() {
   const [vw, vh] = viewSize();
   const fitS = Math.min(r.width / vw, r.height / vh);
   let s = Math.min(r.width / (bw * margin), r.height / (bh * margin));
-  scale = Math.min(Math.max(s, fitS * minMul), fitS * maxMul);
-  const cx = (x1 + x2) / 2, cy = (y1 + y2) / 2;
+  if (dual) scale = Math.min(Math.max(s, fitS), fitS * maxMul);
+  else scale = Math.min(Math.max(s, fitS * minMul), fitS * maxMul);
+  const cx = (fx1 + fx2) / 2, cy = (fy1 + fy2) / 2;
   ox = r.width / 2 - cx * scale;
   oy = r.height / 2 - cy * scale;
   draw();
