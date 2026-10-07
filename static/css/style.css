@@ -326,8 +326,17 @@ body.light .filter-panel {
   background: var(--panel);
   border-bottom: 1px solid var(--line);
   flex-shrink: 0;
+  flex-wrap: wrap;
 }
-.crop-bar input { width: 70px; }
+.crop-cluster-nav {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.crop-cluster-nav.hidden { display: none; }
+.crop-bar input[type="checkbox"] { width: auto; }
+.crop-bar input:not([type="checkbox"]) { width: 70px; }
 .crop-grid {
   flex: 1;
   min-height: 0;
@@ -434,3 +443,58 @@ body.light .filter-panel {
 .modal-box input { width: 100%; margin: 4px 0; }
 .cls-btns { display: flex; flex-direction: column; gap: 6px; margin-bottom: 10px; }
 .cls-btns button { text-align: left; font-weight: 600; }
+.loading-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 90;
+  background: rgba(0, 0, 0, 0.55);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.loading-box {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 20px 28px;
+  min-width: 260px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 14px;
+  text-align: center;
+}
+.loading-spinner {
+  width: 28px;
+  height: 28px;
+  border: 3px solid var(--line);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+#loadingText { color: var(--text); font-size: 14px; white-space: pre-wrap; }
+.loading-bar {
+  width: 260px;
+  height: 10px;
+  background: #333;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  overflow: hidden;
+}
+body.light .loading-bar { background: #ddd; }
+.loading-bar-fill {
+  height: 100%;
+  width: 0%;
+  background: var(--accent);
+  transition: width 0.2s ease;
+}
+.loading-bar.indeterminate .loading-bar-fill {
+  width: 40%;
+  animation: loading-slide 1s ease-in-out infinite;
+}
+@keyframes loading-slide {
+  0% { transform: translateX(-100%); }
+  100% { transform: translateX(300%); }
+}
+.loading-pct { color: var(--muted); font-size: 12px; min-height: 1.2em; }

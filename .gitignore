@@ -12,6 +12,14 @@ data/tracking_cache/
 last_folders.txt
 tracking_cache/
 
+# Local benches (do not commit)
+_smoke_bench.py
+_smoke_bench_out.txt
+_smoke_bench_*.json
+_index_bench.py
+_index_bench_*.txt
+
+
 # Models / large binaries
 *.pt
 *.pth

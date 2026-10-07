@@ -15,7 +15,7 @@ import threading
 import subprocess
 import colorsys
 from pathlib import Path
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from flask import Flask, request, jsonify, send_file, render_template
 import cv2
@@ -59,7 +59,7 @@ IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
 PLACE_W, PLACE_H = 50, 50
 BOX_THICKNESS, LABEL_SIZE = 2, 10
 UNDO_MAX = 10
-CLUSTER_RADIUS = 5.0
+CLUSTER_RADIUS = 8.0
 PHASH_SIZE = 16
 PHASH_BITS = PHASH_SIZE * PHASH_SIZE
 FEATURE_DIM = PHASH_BITS + 256
@@ -81,6 +81,7 @@ FILTER_PARAMS = {
 all_image_list = []
 image_list = []
 current_index = -1
+images_no_txt = 0
 class_filter_id = None
 sort_mode = "name"
 size_filter_on = False
@@ -91,17 +92,27 @@ path_size_pct = {}
 size_ordered_paths = []
 box_size_cache = {}
 box_size_cache_ready = False
+path_classes = {}
 path_wh = {}
 crop_gen = 0
+indexing = False
+index_gen = 0
+index_cur = 0
+index_total = 0
+index_msg = ""
+index_error = ""
+INDEX_WORKERS = max(4, (os.cpu_count() or 8) - 5)
 dataset_clustered = False
 cluster_groups = []
 cluster_ordered_paths = []
 clustering = False
 cluster_msg = ""
+cluster_pct = 0.0
 undo_stack = []
 tracking_enabled = False
 track_status = {}
 crop_refs = []
+crop_cluster_id = None
 
 
 def class_name(cls_idx):
@@ -171,6 +182,10 @@ def label_path(img_path):
 
 
 def load_boxes(img_path):
+    if box_size_cache_ready and img_path in box_size_cache:
+        return [{
+            "cls": e["cls"], "cx": e["cx"], "cy": e["cy"], "w": e["w"], "h": e["h"]
+        } for e in box_size_cache[img_path]]
     boxes = []
     p = label_path(img_path)
     if not os.path.isfile(p):
@@ -190,6 +205,31 @@ def load_boxes(img_path):
     return boxes
 
 
+def drop_from_lists(path):
+    global current_index, all_image_list, image_list, cluster_groups, cluster_ordered_paths, dataset_clustered, crop_refs
+    if path in image_list:
+        image_list.remove(path)
+    if path in all_image_list:
+        all_image_list.remove(path)
+    box_size_cache.pop(path, None)
+    path_box_size.pop(path, None)
+    path_classes.pop(path, None)
+    path_wh.pop(path, None)
+    if box_size_cache_ready:
+        rebuild_size_order()
+    if dataset_clustered:
+        cluster_groups = [[p for p in g if p != path] for g in cluster_groups]
+        cluster_groups = [g for g in cluster_groups if g]
+        cluster_ordered_paths = [p for g in cluster_groups for p in g]
+        if not cluster_groups:
+            dataset_clustered = False
+    crop_refs = []
+    if not image_list:
+        current_index = -1
+    else:
+        current_index = min(current_index, len(image_list) - 1)
+
+
 def write_boxes(path, boxes):
     global crop_refs
     p = label_path(path)
@@ -197,8 +237,12 @@ def write_boxes(path, boxes):
         for b in boxes:
             f.write("%d %.6f %.6f %.6f %.6f\n" % (b["cls"], b["cx"], b["cy"], b["w"], b["h"]))
     crop_refs = []
+    if not boxes:
+        drop_from_lists(path)
+        return
     if box_size_cache_ready:
         cache_boxes_for_path(path, boxes)
+        path_classes[path] = {int(b["cls"]) for b in boxes}
         rebuild_size_order()
 
 
@@ -207,8 +251,11 @@ def copy_boxes(boxes):
 
 
 def image_has_class(path, cls_id):
+    cid = int(cls_id)
+    if box_size_cache_ready and path in path_classes:
+        return cid in path_classes[path]
     for b in load_boxes(path):
-        if int(b["cls"]) == int(cls_id):
+        if int(b["cls"]) == cid:
             return True
     return False
 
@@ -262,10 +309,131 @@ def rebuild_size_order():
 
 def build_size_ranks():
     global box_size_cache_ready
+    if box_size_cache_ready:
+        return
     for p in all_image_list:
-        cache_boxes_for_path(p)
+        boxes = load_boxes(p) if p not in box_size_cache else None
+        if boxes is not None:
+            cache_boxes_for_path(p, boxes)
+            path_classes[p] = {int(b["cls"]) for b in boxes}
+        elif p not in path_classes:
+            path_classes[p] = {int(b["cls"]) for b in box_size_cache.get(p, [])}
     rebuild_size_order()
     box_size_cache_ready = True
+
+
+def clear_dataset_index():
+    global box_size_cache, box_size_cache_ready, path_box_size, path_size_pct, size_ordered_paths
+    global path_wh, path_classes, crop_refs, crop_gen, index_cur, index_total, index_msg, index_error, index_gen
+    index_gen += 1
+    box_size_cache = {}
+    box_size_cache_ready = False
+    path_box_size = {}
+    path_size_pct = {}
+    size_ordered_paths = []
+    path_wh = {}
+    path_classes = {}
+    crop_refs = []
+    crop_gen = 0
+    index_cur = 0
+    index_total = 0
+    index_msg = ""
+    index_error = ""
+
+
+def folders_ready():
+    return bool(IMAGES_DIR and LABELS_DIR and os.path.isdir(IMAGES_DIR) and os.path.isdir(LABELS_DIR) and all_image_list)
+
+
+def start_dataset_index():
+    global indexing, index_msg, index_error, index_cur, index_total, index_gen
+    if not folders_ready():
+        return False
+    if box_size_cache_ready:
+        return False
+    index_gen += 1
+    my_gen = index_gen
+    indexing = True
+    index_error = ""
+    index_cur = 0
+    index_total = len(all_image_list)
+    index_msg = "Starting dataset scan..."
+    paths = list(all_image_list)
+    labels_dir = LABELS_DIR
+    n_workers = INDEX_WORKERS
+
+    def scan_one(p):
+        boxes = []
+        lp = os.path.join(labels_dir, Path(p).stem + ".txt")
+        if os.path.isfile(lp):
+            with open(lp, "r", encoding="utf-8") as f:
+                for line in f:
+                    parts = line.strip().split()
+                    if len(parts) < 5:
+                        continue
+                    boxes.append({
+                        "cls": max(0, int(float(parts[0]))),
+                        "cx": float(parts[1]),
+                        "cy": float(parts[2]),
+                        "w": float(parts[3]),
+                        "h": float(parts[4]),
+                    })
+        entries = []
+        mx = 0.0
+        wh = None
+        if boxes:
+            try:
+                with Image.open(p) as im:
+                    wh = im.size
+            except Exception:
+                wh = (1, 1)
+            iw, ih = wh
+            for b in boxes:
+                area = float(b["w"]) * float(b["h"]) * float(iw) * float(ih)
+                entries.append({
+                    "cls": b["cls"], "cx": b["cx"], "cy": b["cy"], "w": b["w"], "h": b["h"], "area": area
+                })
+                if area > mx:
+                    mx = area
+        return p, entries, mx, {int(b["cls"]) for b in boxes}, wh
+
+    def work():
+        global indexing, box_size_cache_ready, index_cur, index_total, index_msg, index_error, crop_refs
+        try:
+            index_total = len(paths)
+            done = 0
+            with ThreadPoolExecutor(max_workers=n_workers) as ex:
+                futs = [ex.submit(scan_one, p) for p in paths]
+                for fut in as_completed(futs):
+                    if my_gen != index_gen:
+                        break
+                    p, entries, mx, classes, wh = fut.result()
+                    box_size_cache[p] = entries
+                    path_box_size[p] = mx
+                    path_classes[p] = classes
+                    if wh is not None:
+                        path_wh[p] = wh
+                    done += 1
+                    index_cur = done
+                    if done == 1 or done % 25 == 0 or done == index_total:
+                        index_msg = "Scanning labels and box sizes... %d / %d" % (done, index_total)
+            if my_gen != index_gen:
+                return
+            rebuild_size_order()
+            box_size_cache_ready = True
+            crop_refs = []
+            index_msg = "Dataset index ready (%d images)" % len(paths)
+        except Exception as e:
+            if my_gen == index_gen:
+                index_error = str(e)
+                index_msg = "Dataset index failed"
+                box_size_cache_ready = False
+        finally:
+            if my_gen == index_gen:
+                indexing = False
+
+    threading.Thread(target=work, daemon=True).start()
+    return True
 
 
 def base_image_list():
@@ -473,35 +641,52 @@ def push_undo(path, boxes):
 def reload_images():
     global all_image_list, undo_stack, dataset_clustered, cluster_groups, cluster_ordered_paths, crop_refs
     global size_filter_on, path_box_size, path_size_pct, size_ordered_paths, path_wh, crop_gen
-    global box_size_cache, box_size_cache_ready
-    all_image_list = list_images(IMAGES_DIR)
+    global box_size_cache, box_size_cache_ready, crop_cluster_id, images_no_txt
+    raw = list_images(IMAGES_DIR)
+    images_no_txt = 0
+    if LABELS_DIR and os.path.isdir(LABELS_DIR):
+        kept = []
+        for p in raw:
+            lp = label_path(p)
+            if not os.path.isfile(lp):
+                images_no_txt += 1
+                continue
+            if load_boxes(p):
+                kept.append(p)
+        all_image_list = kept
+    else:
+        all_image_list = raw
     undo_stack = []
     dataset_clustered = False
     cluster_groups = []
     cluster_ordered_paths = []
-    crop_refs = []
-    crop_gen = 0
     size_filter_on = False
-    path_box_size = {}
-    path_size_pct = {}
-    size_ordered_paths = []
-    box_size_cache = {}
-    box_size_cache_ready = False
-    path_wh = {}
+    crop_cluster_id = None
+    clear_dataset_index()
     load_classes_from_dir(LABELS_DIR)
     apply_class_filter()
     if tracking_enabled:
         load_or_create_tracking()
+    if folders_ready():
+        start_dataset_index()
 
 
 def ensure_crop_refs():
     global crop_refs, crop_gen
     if crop_refs:
         return
-    if sort_mode in ("size_asc", "size_desc") and not box_size_cache_ready:
+    need_area = sort_mode in ("size_asc", "size_desc")
+    if need_area and not box_size_cache_ready:
         build_size_ranks()
+    paths = list(image_list)
+    if sort_mode == "cluster" and dataset_clustered and crop_cluster_id is not None:
+        if 0 <= int(crop_cluster_id) < len(cluster_groups):
+            allow = set(cluster_groups[int(crop_cluster_id)])
+            paths = [p for p in paths if p in allow]
+        else:
+            paths = []
     refs = []
-    for path in image_list:
+    for path in paths:
         if box_size_cache_ready and path in box_size_cache:
             boxes = [(bi, e) for bi, e in enumerate(box_size_cache[path])]
         else:
@@ -509,7 +694,10 @@ def ensure_crop_refs():
         for bi, b in boxes:
             if class_filter_id is not None and int(b["cls"]) != int(class_filter_id):
                 continue
-            refs.append({"path": path, "box": b, "box_i": bi, "area": b.get("area", box_pixel_area(path, b))})
+            area = b.get("area")
+            if need_area and area is None:
+                area = box_pixel_area(path, b)
+            refs.append({"path": path, "box": b, "box_i": bi, "area": area if area is not None else 0.0})
     if sort_mode == "size_desc":
         refs.sort(key=lambda r: r["area"], reverse=True)
     elif sort_mode == "size_asc":
@@ -606,11 +794,19 @@ def state_payload():
         "size_filter_lo": size_filter_lo,
         "size_filter_hi": size_filter_hi,
         "size_filter_ready": box_size_cache_ready,
+        "index_ready": box_size_cache_ready,
+        "indexing": indexing,
+        "index_cur": index_cur,
+        "index_total": index_total,
+        "index_msg": index_msg,
+        "index_error": index_error,
         "dataset_clustered": dataset_clustered,
         "cluster_count": len(cluster_groups),
         "clusters": [{"i": i, "n": len(g)} for i, g in enumerate(cluster_groups)],
         "clustering": clustering,
         "cluster_msg": cluster_msg,
+        "cluster_pct": cluster_pct,
+        "crop_cluster_id": crop_cluster_id,
         "tracking": tracking_enabled,
         "place_w": PLACE_W,
         "place_h": PLACE_H,
@@ -657,16 +853,13 @@ def apply_folder(kind, d):
     else:
         LABELS_DIR = d
         save_last_folders()
-        load_classes_from_dir(LABELS_DIR)
-        if image_list or all_image_list:
-            apply_class_filter(current_path())
-        else:
-            reload_images()
+        reload_images()
     msg = None
     if tracking_enabled:
         msg = load_or_create_tracking()
     out = state_payload()
     out["track_info"] = msg
+    out["index_started"] = indexing or box_size_cache_ready
     return out
 
 
@@ -746,11 +939,17 @@ def pick_directory(title, initial):
 
 @app.route("/api/browse", methods=["POST"])
 def api_browse():
-    kind = (request.get_json(force=True) or {}).get("kind")
-    initial = IMAGES_DIR if kind == "images" else LABELS_DIR
+    data = request.get_json(force=True) or {}
+    kind = data.get("kind")
+    initial = (data.get("initial") or "").strip()
+    if not initial or not os.path.isdir(initial):
+        initial = IMAGES_DIR if kind == "images" else LABELS_DIR
     if not initial or not os.path.isdir(initial):
         initial = os.path.expanduser("~")
-    title = "Select images folder" if kind == "images" else "Select annotations folder"
+    if kind == "images":
+        title = "Select images folder"
+    else:
+        title = "Select annotations folder"
     try:
         d = pick_directory(title, initial)
     except Exception as e:
@@ -762,7 +961,9 @@ def api_browse():
         }), 500
     if not d:
         return jsonify(state_payload())
-    return jsonify(apply_folder(kind, d))
+    out = apply_folder(kind, d)
+    out["folder_picked"] = True
+    return jsonify(out)
 
 
 @app.route("/api/set_dir", methods=["POST"])
@@ -775,6 +976,29 @@ def api_set_dir():
     if not path or not os.path.isdir(path):
         return jsonify({"error": "Folder not found: %s" % path}), 400
     return jsonify(apply_folder(kind, os.path.abspath(path)))
+
+
+@app.route("/api/index/build", methods=["POST"])
+def api_index_build():
+    if not folders_ready():
+        return jsonify({"error": "Set both images and annotations folders first."}), 400
+    if box_size_cache_ready:
+        return jsonify(state_payload())
+    start_dataset_index()
+    return jsonify(state_payload())
+
+
+@app.route("/api/index/status")
+def api_index_status():
+    return jsonify({
+        "indexing": indexing,
+        "index_ready": box_size_cache_ready,
+        "index_cur": index_cur,
+        "index_total": index_total,
+        "index_msg": index_msg,
+        "index_error": index_error,
+        "pct": (100.0 * index_cur / index_total) if index_total else (100.0 if box_size_cache_ready else 0.0),
+    })
 
 
 @app.route("/api/goto", methods=["POST"])
@@ -834,28 +1058,10 @@ def api_delete():
             os.remove(txt)
     except OSError as e:
         return jsonify({"error": str(e)}), 400
-    if path in image_list:
-        image_list.remove(path)
-    if path in all_image_list:
-        all_image_list.remove(path)
-    box_size_cache.pop(path, None)
-    path_box_size.pop(path, None)
-    if box_size_cache_ready:
-        rebuild_size_order()
+    drop_from_lists(path)
     if tracking_enabled:
         track_status.pop(track_key(path), None)
         save_tracking_json()
-    if dataset_clustered:
-        cluster_groups = [[p for p in g if p != path] for g in cluster_groups]
-        cluster_groups = [g for g in cluster_groups if g]
-        cluster_ordered_paths = [p for g in cluster_groups for p in g]
-        if not cluster_groups:
-            dataset_clustered = False
-    crop_refs = []
-    if not image_list:
-        current_index = -1
-    else:
-        current_index = min(current_index, len(image_list) - 1)
     return jsonify(state_payload())
 
 
@@ -900,7 +1106,7 @@ def api_size_filter():
 
 @app.route("/api/sort", methods=["POST"])
 def api_sort():
-    global sort_mode
+    global sort_mode, crop_cluster_id, crop_refs
     mode = (request.get_json(force=True) or {}).get("mode") or "name"
     if mode not in ("name", "cluster", "size_asc", "size_desc"):
         return jsonify({"error": "Invalid sort mode"}), 400
@@ -912,31 +1118,66 @@ def api_sort():
         build_size_ranks()
     keep = current_path()
     sort_mode = mode
+    if mode == "cluster" and dataset_clustered:
+        if crop_cluster_id is None or not (0 <= int(crop_cluster_id) < len(cluster_groups)):
+            crop_cluster_id = 0
+    else:
+        crop_cluster_id = None
+    crop_refs = []
     apply_class_filter(keep)
+    return jsonify(state_payload())
+
+
+@app.route("/api/crop_cluster", methods=["POST"])
+def api_crop_cluster():
+    global crop_cluster_id, crop_refs, current_index
+    data = request.get_json(force=True) or {}
+    if "cluster" in data and data.get("cluster") is None:
+        crop_cluster_id = None
+        crop_refs = []
+        return jsonify(state_payload())
+    if not dataset_clustered or not cluster_groups:
+        return jsonify({"error": "Images are not clustered yet."}), 400
+    if "cluster" not in data:
+        return jsonify({"error": "cluster required"}), 400
+    ci = int(data["cluster"])
+    if ci < 0 or ci >= len(cluster_groups):
+        return jsonify({"error": "Invalid cluster"}), 400
+    crop_cluster_id = ci
+    crop_refs = []
+    for p in cluster_groups[ci]:
+        if p in image_list:
+            current_index = image_list.index(p)
+            break
     return jsonify(state_payload())
 
 
 @app.route("/api/cluster", methods=["POST"])
 def api_cluster():
-    global clustering, cluster_msg
+    global clustering, cluster_msg, cluster_pct
     if clustering or not all_image_list:
         return jsonify(state_payload())
     clustering = True
+    cluster_pct = 0.0
     cluster_msg = "Clustering dataset... extracting features"
     paths = list(all_image_list)
 
     def work():
-        global clustering, dataset_clustered, cluster_groups, cluster_ordered_paths, cluster_msg, crop_refs
+        global clustering, dataset_clustered, cluster_groups, cluster_ordered_paths, cluster_msg, crop_refs, cluster_pct
         try:
-            feats = np.zeros((len(paths), FEATURE_DIM), dtype=np.float32)
+            n = len(paths)
+            feats = np.zeros((n, FEATURE_DIM), dtype=np.float32)
             with ThreadPoolExecutor(max_workers=max(1, CLUSTER_WORKERS)) as pool:
                 for i, feat in enumerate(pool.map(extract_phash_feature, paths)):
                     if feat is not None:
                         feats[i] = feat
-            assigned = np.zeros(len(paths), dtype=bool)
+                    cluster_pct = 70.0 * (i + 1) / float(n)
+                    cluster_msg = "Extracting features... %d / %d" % (i + 1, n)
+            assigned = np.zeros(n, dtype=bool)
             groups = []
             r2 = CLUSTER_RADIUS * CLUSTER_RADIUS
-            for seed in range(len(paths)):
+            cluster_msg = "Grouping similar images..."
+            for seed in range(n):
                 if assigned[seed]:
                     continue
                 diff = feats - feats[seed]
@@ -945,14 +1186,18 @@ def api_cluster():
                 members = np.nonzero(d2 <= r2)[0]
                 assigned[members] = True
                 groups.append([paths[j] for j in members.tolist()])
+                cluster_pct = 70.0 + 30.0 * float(assigned.sum()) / float(n)
+                cluster_msg = "Grouping similar images... %d / %d" % (int(assigned.sum()), n)
             groups = sorted(groups, key=len, reverse=True)
             cluster_groups = groups
             cluster_ordered_paths = [p for g in groups for p in g]
             dataset_clustered = True
             crop_refs = []
+            cluster_pct = 100.0
             cluster_msg = "Clustered into %d groups" % len(groups)
         except Exception as e:
             cluster_msg = str(e)
+            cluster_pct = 0.0
         clustering = False
 
     threading.Thread(target=work, daemon=True).start()
@@ -1027,7 +1272,12 @@ def api_stats():
             i = int(b["cls"])
             if 0 <= i < len(counts):
                 counts[i] += 1
-    lines = ["Images: %d" % len(image_list), "Boxes: %d" % n_box, ""]
+    lines = [
+        "Images: %d" % len(image_list),
+        "Images with no txt: %d" % images_no_txt,
+        "Boxes: %d" % n_box,
+        "",
+    ]
     for i, n in enumerate(counts):
         lines.append("%d %s: %d" % (i, class_name(i), n))
     return jsonify({"text": "\n".join(lines)})
@@ -1050,7 +1300,7 @@ def api_crops():
             "cls_name": class_name(b["cls"]),
             "color": class_hex(b["cls"]),
             "cx": b["cx"], "cy": b["cy"], "w": b["w"], "h": b["h"],
-            "area": r.get("area", box_pixel_area(r["path"], b)),
+            "area": r.get("area", 0.0),
         })
     return jsonify({
         "total": len(crop_refs),
@@ -1101,9 +1351,7 @@ def api_open_crop():
     return jsonify(out)
 
 
-load_last_folders()
 os.makedirs(DATA_DIR, exist_ok=True)
-reload_images()
 
 
 if __name__ == "__main__":

@@ -30,6 +30,80 @@ function showModal(text, extraHtml) {
 }
 function hideModal() { document.getElementById("modal").classList.add("hidden"); }
 document.getElementById("modalOk").onclick = hideModal;
+function showLoading(text, pct) {
+  document.getElementById("loadingText").textContent = text || "Loading…";
+  const bar = document.getElementById("loadingBar");
+  const fill = document.getElementById("loadingBarFill");
+  const pctEl = document.getElementById("loadingPct");
+  if (pct == null || pct === "" || isNaN(+pct)) {
+    bar.classList.add("indeterminate");
+    fill.style.width = "40%";
+    pctEl.textContent = "";
+  } else {
+    bar.classList.remove("indeterminate");
+    const p = Math.max(0, Math.min(100, +pct));
+    fill.style.width = p + "%";
+    pctEl.textContent = Math.round(p) + "%";
+  }
+  document.getElementById("loadingOverlay").classList.remove("hidden");
+}
+function hideLoading() {
+  document.getElementById("loadingOverlay").classList.add("hidden");
+}
+let indexPollTimer = null;
+function stopIndexPoll() {
+  if (indexPollTimer) { clearTimeout(indexPollTimer); indexPollTimer = null; }
+}
+function pollDatasetIndex() {
+  stopIndexPoll();
+  showLoading("Scanning dataset labels and sizes…", 0);
+  const tick = () => {
+    api("/api/index/status").then((j) => {
+      if (j.index_error) {
+        hideLoading();
+        showModal("Dataset index failed:\n" + j.index_error);
+        return;
+      }
+      showLoading(j.index_msg || "Scanning…", j.pct);
+      if (j.indexing) {
+        indexPollTimer = setTimeout(tick, 200);
+        return;
+      }
+      if (j.index_ready) {
+        hideLoading();
+        api("/api/state").then((st) => applyState(st, true));
+        api("/api/stats").then((j2) => {
+          let t = (j.index_msg || "Dataset scan ready") + "\n\n" + (j2.text || "");
+          if (pendingTrackInfo && pendingTrackInfo.message) t += "\n\n" + pendingTrackInfo.message;
+          pendingTrackInfo = null;
+          showModal(t);
+        }).catch(() => {
+          showModal(j.index_msg || "Dataset scan ready");
+          pendingTrackInfo = null;
+        });
+        return;
+      }
+      post("/api/index/build")
+        .then(() => { indexPollTimer = setTimeout(tick, 200); })
+        .catch((err) => { hideLoading(); showModal(err.message || String(err)); });
+    }).catch((err) => { hideLoading(); showModal(err.message || String(err)); });
+  };
+  tick();
+}
+let pendingTrackInfo = null;
+function afterLabelsFolder(st) {
+  pendingTrackInfo = st.track_info || null;
+  if (st.images_dir && st.labels_dir) pollDatasetIndex();
+  else {
+    hideLoading();
+    if (st.track_info) showModal(st.track_info.message);
+  }
+}
+function maybeStartIndex(st) {
+  if (!st || !st.images_dir || !st.labels_dir) return;
+  if (st.index_ready && !st.indexing) return;
+  pollDatasetIndex();
+}
 
 function applyState(st, keepView) {
   S = st;
@@ -100,7 +174,41 @@ function fillClusterJump(st) {
   const use = sortMode === "cluster" && st.dataset_clustered;
   el.classList.toggle("hidden", !use);
   jump.classList.toggle("hidden", use);
-  el.innerHTML = (st.clusters || []).map((c) => "<option value='" + c.i + "'>C" + (c.i + 1) + " (" + c.n + ")</option>").join("");
+  const opts = (st.clusters || []).map((c) => "<option value='" + c.i + "'>C" + (c.i + 1) + " (" + c.n + ")</option>").join("");
+  el.innerHTML = opts;
+  const cropSel = document.getElementById("cropClusterJump");
+  if (cropSel) {
+    const prev = cropSel.value;
+    cropSel.innerHTML = opts;
+    if (st.crop_cluster_id != null) cropSel.value = String(st.crop_cluster_id);
+    else if (prev !== "" && [...cropSel.options].some((o) => o.value === prev)) cropSel.value = prev;
+  }
+  syncCropClusterNav(st);
+}
+function syncCropClusterNav(st) {
+  const wrap = document.getElementById("cropClusterNav");
+  if (!wrap) return;
+  const s = st || S;
+  const sortMode = s && (s.sort_mode || (s.sort_by_cluster ? "cluster" : "name"));
+  const show = isCropPage() && sortMode === "cluster" && s && s.dataset_clustered;
+  wrap.classList.toggle("hidden", !show);
+  const en = document.getElementById("enableCropCluster");
+  if (en && s) en.checked = s.crop_cluster_id != null;
+  const sel = document.getElementById("cropClusterJump");
+  const prev = document.getElementById("cropClusterPrev");
+  const next = document.getElementById("cropClusterNext");
+  const on = !!(en && en.checked);
+  if (sel) sel.classList.toggle("hidden", !on);
+  if (prev) prev.classList.toggle("hidden", !on);
+  if (next) next.classList.toggle("hidden", !on);
+}
+function cropClusterStep(dir) {
+  if (!S || !S.dataset_clustered || !(S.clusters || []).length) return;
+  const n = S.clusters.length;
+  let ci = S.crop_cluster_id;
+  if (ci == null) ci = 0;
+  ci = (ci + dir + n) % n;
+  post("/api/crop_cluster", { cluster: ci }).then(afterFilter);
 }
 
 function renderNav(st) {
@@ -265,6 +373,7 @@ function draw() {
 
 function saveBoxes(changed) {
   return post("/api/boxes", { boxes: S.boxes, changed: !!changed }).then((st) => {
+    if (changed) cropPopupDirty = true;
     applyState(st, true);
     if (popupOpen()) drawCropPopup();
   });
@@ -428,8 +537,12 @@ function syncFilterBarForPage() {
   document.getElementById("classFilterWrap").classList.toggle("hidden", !classOn);
   document.getElementById("clusterSortWrap").classList.toggle("hidden", !clusterOn);
   document.getElementById("sizeFilterWrap").classList.toggle("hidden", !sizeOn);
+  syncCropClusterNav(S);
 }
 let cropShown = 0, cropTotal = 0, cropGen = 0, cropLoadId = 0;
+let cropRestoreScroll = null;
+let cropFocusHint = null;
+let cropPopupDirty = false;
 function cropShowCount() {
   const el = document.getElementById("cropShow");
   const v = el ? el.value : "100";
@@ -439,11 +552,15 @@ function afterFilter(st, keepView) {
   applyState(st, keepView !== false);
   if (isCropPage() && !(st && st.clustering)) resetAndLoadCrops(cropShowCount());
 }
-function resetAndLoadCrops(n) {
+function resetAndLoadCrops(n, opts) {
+  opts = opts || {};
+  cropRestoreScroll = opts.keepScroll != null ? opts.keepScroll : null;
+  if (opts.focusHint) cropFocusHint = opts.focusHint;
   cropShown = 0;
   cropLoadId += 1;
   document.getElementById("cropGrid").innerHTML = "";
-  document.getElementById("cropStatus").textContent = "0 crops loaded";
+  document.getElementById("cropStatus").textContent = "Loading crops…";
+  if (!opts.quiet) showLoading("Loading crops…\nPlease wait.");
   loadCrops(n == null ? cropShowCount() : n, cropLoadId);
 }
 
@@ -475,24 +592,26 @@ document.getElementById("enableSizeFilter") && (document.getElementById("enableS
     post("/api/size_filter", { enabled: false }).then(afterFilter);
     return;
   }
-  showModal("Measuring box sizes…\nSorting images by box area.");
-  document.getElementById("modalOk").classList.add("hidden");
-  post("/api/size_filter/build")
-    .then((st) => {
-      document.getElementById("modalOk").classList.remove("hidden");
-      hideModal();
-      document.getElementById("sizeMin").value = "0";
-      document.getElementById("sizeMax").value = "1";
-      document.getElementById("sizeMinVal").textContent = "0.00";
-      document.getElementById("sizeMaxVal").textContent = "1.00";
-      afterFilter(st);
-    })
-    .catch((err) => {
-      document.getElementById("modalOk").classList.remove("hidden");
-      document.getElementById("enableSizeFilter").checked = false;
-      syncFilterBarForPage();
-      showModal(err.message || String(err));
-    });
+  const finishEnable = (st) => {
+    document.getElementById("sizeMin").value = "0";
+    document.getElementById("sizeMax").value = "1";
+    document.getElementById("sizeMinVal").textContent = "0.00";
+    document.getElementById("sizeMaxVal").textContent = "1.00";
+    afterFilter(st);
+  };
+  if (S && S.size_filter_ready) {
+    post("/api/size_filter", { enabled: true, lo: 0, hi: 1 }).then(finishEnable)
+      .catch((err) => {
+        document.getElementById("enableSizeFilter").checked = false;
+        syncFilterBarForPage();
+        showModal(err.message || String(err));
+      });
+    return;
+  }
+  maybeStartIndex(S || {});
+  document.getElementById("enableSizeFilter").checked = false;
+  syncFilterBarForPage();
+  showModal("Dataset index is still building.\nWait for the scan to finish, then enable size filter again.");
 });
 function applySizeRange() {
   const minEl = document.getElementById("sizeMin");
@@ -519,39 +638,49 @@ document.querySelectorAll('input[name="sort"]').forEach((r) => {
   r.onchange = () => {
     const needBuild = (r.value === "size_asc" || r.value === "size_desc") && !(S && S.size_filter_ready);
     if (needBuild) {
-      showModal("Measuring box sizes…\nReading label files.");
-      document.getElementById("modalOk").classList.add("hidden");
+      maybeStartIndex(S || {});
+      showModal("Dataset index is still building.\nWait for the scan to finish, then try size sort again.");
+      r.checked = false;
+      document.querySelector('input[name="sort"][value="name"]').checked = true;
+      return;
     }
     post("/api/sort", { mode: r.value })
-      .then((st) => {
-        if (needBuild) {
-          document.getElementById("modalOk").classList.remove("hidden");
-          hideModal();
-        }
-        afterFilter(st);
-      })
+      .then((st) => afterFilter(st))
       .catch((err) => {
-        if (needBuild) {
-          document.getElementById("modalOk").classList.remove("hidden");
-          hideModal();
-        }
         r.checked = false;
         document.querySelector('input[name="sort"][value="name"]').checked = true;
         showModal(err.message);
       });
   };
 });
-document.getElementById("clusterBtn").onclick = () => post("/api/cluster").then((st) => {
-  applyState(st, true);
-  pollCluster();
-});
-function pollCluster() {
-  if (!S || !S.clustering) return;
-  setTimeout(() => api("/api/state").then((st) => {
+document.getElementById("clusterBtn").onclick = () => {
+  showLoading("Clustering dataset…", 0);
+  post("/api/cluster").then((st) => {
     applyState(st, true);
-    if (st.clustering) pollCluster();
-    else if (isCropPage()) resetAndLoadCrops(cropShowCount());
-  }), 800);
+    pollCluster();
+  }).catch((err) => {
+    hideLoading();
+    showModal(err.message || String(err));
+  });
+};
+function pollCluster() {
+  const tick = () => {
+    api("/api/state").then((st) => {
+      applyState(st, true);
+      showLoading(st.cluster_msg || "Clustering…", st.cluster_pct);
+      if (st.clustering) {
+        setTimeout(tick, 250);
+        return;
+      }
+      hideLoading();
+      if (st.cluster_msg && st.dataset_clustered) showModal(st.cluster_msg);
+      if (isCropPage()) resetAndLoadCrops(cropShowCount());
+    }).catch((err) => {
+      hideLoading();
+      showModal(err.message || String(err));
+    });
+  };
+  tick();
 }
 document.getElementById("showBoxes").onchange = draw;
 document.getElementById("showLabels").onchange = draw;
@@ -578,24 +707,60 @@ document.getElementById("cropPShowBoxes").onchange = () => { if (popupOpen()) dr
 document.getElementById("cropPShowLabels").onchange = () => { if (popupOpen()) drawCropPopup(); };
 document.getElementById("fitBtn").onclick = fit;
 document.getElementById("checkedBtn").onclick = () => post("/api/checked").then(applyState);
-document.getElementById("delBtn").onclick = () => {
-  if (confirm("Delete this image and its label file?")) post("/api/delete").then(applyState);
-};
+document.getElementById("delBtn").onclick = () => post("/api/delete").then(applyState);
 document.getElementById("statsBtn").onclick = () => api("/api/stats").then((j) => showModal(j.text));
+function parentDir(p) {
+  if (!p) return "";
+  const s = String(p).replace(/[\\/]+$/, "");
+  const i = Math.max(s.lastIndexOf("/"), s.lastIndexOf("\\"));
+  if (i <= 0) return s;
+  if (i === 2 && s[1] === ":") return s.slice(0, 3);
+  return s.slice(0, i);
+}
+function promptAnnotations(st) {
+  const start = parentDir(st.images_dir) || st.images_dir || "";
+  showModal(
+    "Images folder set.\n\nPlease choose the annotations folder.\n" +
+    "Click OK to open the folder picker (starts one folder above the images directory)."
+  );
+  const ok = document.getElementById("modalOk");
+  ok.onclick = () => {
+    hideModal();
+    ok.onclick = hideModal;
+    post("/api/browse", { kind: "labels", initial: start })
+      .then((st2) => {
+        applyState(st2);
+        afterLabelsFolder(st2);
+      })
+      .catch((err) => { hideLoading(); showModal(err.message || String(err)); });
+  };
+}
 function applyDir(kind, path) {
   post("/api/set_dir", { kind, path })
-    .then((st) => { applyState(st); if (st.track_info) showModal(st.track_info.message); })
-    .catch((err) => showModal(err.message || String(err)));
+    .then((st) => {
+      applyState(st);
+      if (kind === "images" && st.images_dir) promptAnnotations(st);
+      else afterLabelsFolder(st);
+    })
+    .catch((err) => { hideLoading(); showModal(err.message || String(err)); });
 }
 document.getElementById("browseImages").onclick = () => {
   post("/api/browse", { kind: "images" })
-    .then((st) => { applyState(st); if (st.track_info) showModal(st.track_info.message); })
-    .catch((err) => showModal(err.message || String(err)));
+    .then((st) => {
+      applyState(st);
+      if (st.folder_picked && st.images_dir) promptAnnotations(st);
+    })
+    .catch((err) => { hideLoading(); showModal(err.message || String(err)); });
 };
 document.getElementById("browseLabels").onclick = () => {
-  post("/api/browse", { kind: "labels" })
-    .then((st) => { applyState(st); if (st.track_info) showModal(st.track_info.message); })
-    .catch((err) => showModal(err.message || String(err)));
+  const start = parentDir(S && S.images_dir) || (S && S.labels_dir) || "";
+  post("/api/browse", { kind: "labels", initial: start || undefined })
+    .then((st) => {
+      applyState(st);
+      if (st.folder_picked) afterLabelsFolder(st);
+      else hideLoading();
+    })
+    .catch((err) => { hideLoading(); showModal(err.message || String(err)); });
 };
 document.getElementById("applyImagesDir").onclick = () => applyDir("images", document.getElementById("dirImages").value);
 document.getElementById("applyLabelsDir").onclick = () => applyDir("labels", document.getElementById("dirLabels").value);
@@ -682,6 +847,23 @@ document.getElementById("cropShow").onchange = () => {
   document.getElementById("cropShow").blur();
   resetAndLoadCrops(cropShowCount());
 };
+document.getElementById("enableCropCluster") && (document.getElementById("enableCropCluster").onchange = () => {
+  const on = document.getElementById("enableCropCluster").checked;
+  if (!on) {
+    post("/api/crop_cluster", { cluster: null }).then(afterFilter);
+    return;
+  }
+  const sel = document.getElementById("cropClusterJump");
+  const ci = sel && sel.value !== "" ? +sel.value : (S && S.crop_cluster_id != null ? S.crop_cluster_id : 0);
+  post("/api/crop_cluster", { cluster: ci }).then(afterFilter);
+});
+document.getElementById("cropClusterJump") && (document.getElementById("cropClusterJump").onchange = () => {
+  document.getElementById("cropClusterJump").blur();
+  if (!document.getElementById("enableCropCluster").checked) return;
+  post("/api/crop_cluster", { cluster: +document.getElementById("cropClusterJump").value }).then(afterFilter);
+});
+document.getElementById("cropClusterPrev") && (document.getElementById("cropClusterPrev").onclick = () => cropClusterStep(-1));
+document.getElementById("cropClusterNext") && (document.getElementById("cropClusterNext").onclick = () => cropClusterStep(1));
 
 const pCv = document.getElementById("cropPopupCv");
 const pCtx = pCv.getContext("2d");
@@ -743,6 +925,8 @@ function fitCropPopup() {
   drawCropPopup();
 }
 function openCropPopup(it) {
+  cropPopupDirty = false;
+  cropFocusHint = { name: it.name || "", cls: it.cls, cls_name: it.cls_name || "" };
   post("/api/open_crop", { i: it.i }).then((st) => {
     applyState(st, true);
     selected = -1;
@@ -768,9 +952,15 @@ function openCropPopup(it) {
 }
 function closeCropPopup() {
   const was = popupOpen();
+  const grid = document.getElementById("cropGrid");
+  const scroll = grid ? grid.scrollTop : 0;
+  const hint = cropFocusHint;
   document.getElementById("cropPopup").classList.add("hidden");
   pImg = null; pPan = false; pLast = null; drag = null;
-  if (was && isCropPage()) resetAndLoadCrops(cropShowCount());
+  if (was && isCropPage() && cropPopupDirty) {
+    resetAndLoadCrops(cropShowCount(), { keepScroll: scroll, focusHint: hint, quiet: true });
+  }
+  cropPopupDirty = false;
 }
 document.getElementById("cropPopupClose").onclick = closeCropPopup;
 document.getElementById("cropPopup").addEventListener("click", (e) => {
@@ -904,6 +1094,8 @@ function loadCrops(n, loadId) {
     j.items.forEach((it) => {
       const d = document.createElement("div");
       d.className = "crop-cell";
+      d.dataset.name = it.name || "";
+      d.dataset.cls = String(it.cls);
       d.title = "#" + (it.i + 1) + " | " + it.name + " | " + it.cls_name;
       d.innerHTML = "<img src='/api/crop_thumb/" + it.i + "?g=" + cropGen + "' alt='' loading='lazy' />";
       d.onclick = () => openCropPopup(it);
@@ -911,6 +1103,27 @@ function loadCrops(n, loadId) {
     });
     cropShown += j.items.length;
     document.getElementById("cropStatus").textContent = cropShown + " / " + cropTotal + " crops";
+    hideLoading();
+    if (cropFocusHint) {
+      const hint = cropFocusHint;
+      cropFocusHint = null;
+      const hit = [...grid.querySelectorAll(".crop-cell")].find((c) =>
+        c.dataset.name === hint.name && (hint.cls == null || String(hint.cls) === c.dataset.cls)
+      );
+      if (hit) hit.scrollIntoView({ block: "center" });
+      else if (cropRestoreScroll != null) grid.scrollTop = cropRestoreScroll;
+      cropRestoreScroll = null;
+    } else if (cropRestoreScroll != null) {
+      grid.scrollTop = cropRestoreScroll;
+      cropRestoreScroll = null;
+    }
+  }).catch((err) => {
+    if (id !== cropLoadId) return;
+    hideLoading();
+    cropRestoreScroll = null;
+    cropFocusHint = null;
+    document.getElementById("cropStatus").textContent = "Crop load failed";
+    showModal("Crop load failed: " + (err.message || err));
   });
 }
 
@@ -929,6 +1142,7 @@ function isTypingTarget(el) {
 
 window.addEventListener("keydown", (e) => {
   if (e.key === "Escape") {
+    if (!document.getElementById("loadingOverlay").classList.contains("hidden")) return;
     if (!document.getElementById("modal").classList.contains("hidden")) { hideModal(); return; }
     if (popupOpen()) { closeCropPopup(); return; }
     hideModal();
@@ -940,7 +1154,16 @@ window.addEventListener("keydown", (e) => {
   if (k === "r") setMode("remove");
   if (k === "q") setMode("place");
   if (k === "f") { if (popupOpen()) fitCropPopup(); else fit(); }
-  if (k === "c" && S && S.tracking) post("/api/checked").then(applyState);
+  if (k === "c") {
+    if (popupOpen()) return;
+    const el = document.getElementById("cropFocus");
+    el.checked = !el.checked;
+    el.dispatchEvent(new Event("change"));
+  }
+  if (k === "tab" && S && S.tracking) {
+    e.preventDefault();
+    post("/api/checked").then(applyState);
+  }
   if (k === "b") {
     const el = popupOpen() ? document.getElementById("cropPShowBoxes") : document.getElementById("showBoxes");
     el.checked = !el.checked;
@@ -957,10 +1180,26 @@ window.addEventListener("keydown", (e) => {
   }
   if (k === "arrowleft" || k === "a") {
     if (popupOpen()) return;
+    if (isCropPage()) {
+      const sortMode = S && (S.sort_mode || (S.sort_by_cluster ? "cluster" : "name"));
+      if (sortMode === "cluster" && S.dataset_clustered && document.getElementById("enableCropCluster") && document.getElementById("enableCropCluster").checked) {
+        e.preventDefault();
+        cropClusterStep(-1);
+      }
+      return;
+    }
     e.preventDefault(); document.getElementById("prevBtn").click();
   }
   if (k === "arrowright" || k === "d") {
     if (popupOpen()) return;
+    if (isCropPage()) {
+      const sortMode = S && (S.sort_mode || (S.sort_by_cluster ? "cluster" : "name"));
+      if (sortMode === "cluster" && S.dataset_clustered && document.getElementById("enableCropCluster") && document.getElementById("enableCropCluster").checked) {
+        e.preventDefault();
+        cropClusterStep(1);
+      }
+      return;
+    }
     e.preventDefault(); document.getElementById("nextBtn").click();
   }
   if (k === "delete") {
@@ -1052,6 +1291,7 @@ window.addEventListener("resize", () => { if (img) fit(); });
 setTimeout(function () {
   api("/api/state").then((st) => {
     applyState(st);
+    maybeStartIndex(st);
     activeFilters = [...document.querySelectorAll(".fchk")].filter((c) => c.checked).map((c) => c.dataset.f);
     if (activeFilters.length) updateFilterPanel();
   }).catch((err) => {

@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>LabelImage</title>
-  <link rel="stylesheet" href="/static/css/style.css?v=13" />
+  <link rel="stylesheet" href="/static/css/style.css?v=17" />
 </head>
 <body>
   <header class="topbar">
@@ -116,13 +116,13 @@
       <div class="tools">
         <label class="row"><input id="showBoxes" type="checkbox" checked /> Boxes</label>
         <label class="row"><input id="showLabels" type="checkbox" checked /> Labels</label>
-        <label class="row"><input id="cropFocus" type="checkbox" /> Crop Focus</label>
+        <label class="row"><input id="cropFocus" type="checkbox" /> Crop Focus (C)</label>
         <button id="editBtn" class="mode">Edit (E)</button>
         <button id="removeBtn" class="mode">Remove (R)</button>
         <button id="placeBtn" class="mode">Place Box (Q)</button>
         <button id="statsBtn">Stats</button>
         <span class="grow"></span>
-        <button id="checkedBtn" class="hidden checked">Image Checked (C)</button>
+        <button id="checkedBtn" class="hidden checked">Image Checked (Tab)</button>
         <button id="fitBtn">Fit Image (F)</button>
         <button id="delBtn" class="danger">Delete Image (Del)</button>
       </div>
@@ -151,6 +151,12 @@
         <option value="500">Show 500</option>
         <option value="all">Show All</option>
       </select>
+      <span id="cropClusterNav" class="crop-cluster-nav hidden">
+        <label class="row"><input id="enableCropCluster" type="checkbox" checked /> Cluster selection</label>
+        <select id="cropClusterJump"></select>
+        <button type="button" id="cropClusterPrev">Previous Cluster (A)</button>
+        <button type="button" id="cropClusterNext">Next Cluster (D)</button>
+      </span>
       <span id="cropStatus">0 crops loaded</span>
     </div>
     <div id="cropGrid" class="crop-grid"></div>
@@ -182,6 +188,16 @@
       <button id="modalOk">OK</button>
     </div>
   </div>
-  <script src="/static/js/app.js?v=22"></script>
+  <div id="loadingOverlay" class="loading-overlay hidden">
+    <div class="loading-box">
+      <div class="loading-spinner"></div>
+      <div id="loadingText">Loading…</div>
+      <div id="loadingBar" class="loading-bar indeterminate">
+        <div id="loadingBarFill" class="loading-bar-fill"></div>
+      </div>
+      <div id="loadingPct" class="loading-pct"></div>
+    </div>
+  </div>
+  <script src="/static/js/app.js?v=36"></script>
 </body>
 </html>
