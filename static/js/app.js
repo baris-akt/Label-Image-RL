@@ -70,16 +70,19 @@ function pollDatasetIndex() {
         return;
       }
       if (j.index_ready) {
-        hideLoading();
-        api("/api/state").then((st) => applyState(st, true));
-        api("/api/stats").then((j2) => {
-          let t = (j.index_msg || "Dataset scan ready") + "\n\n" + (j2.text || "");
+        api("/api/state").then((st) => {
+          applyState(st);
+          return api("/api/stats");
+        }).then((j2) => {
+          hideLoading();
+          let t = "Scan finished\n\n" + (j2.text || "");
           if (pendingTrackInfo && pendingTrackInfo.message) t += "\n\n" + pendingTrackInfo.message;
           pendingTrackInfo = null;
           showModal(t);
-        }).catch(() => {
-          showModal(j.index_msg || "Dataset scan ready");
+        }).catch((err) => {
+          hideLoading();
           pendingTrackInfo = null;
+          showModal("Scan finished\n\n" + (err.message || String(err)));
         });
         return;
       }
@@ -707,7 +710,31 @@ document.getElementById("cropPShowBoxes").onchange = () => { if (popupOpen()) dr
 document.getElementById("cropPShowLabels").onchange = () => { if (popupOpen()) drawCropPopup(); };
 document.getElementById("fitBtn").onclick = fit;
 document.getElementById("checkedBtn").onclick = () => post("/api/checked").then(applyState);
-document.getElementById("delBtn").onclick = () => post("/api/delete").then(applyState);
+let delConfirmOpen = false;
+function doDelete() {
+  post("/api/delete").then(applyState).catch((err) => showModal(err.message || String(err)));
+}
+function closeDelConfirm() {
+  delConfirmOpen = false;
+  document.getElementById("modalOk").classList.remove("hidden");
+  hideModal();
+}
+function openDelConfirm() {
+  delConfirmOpen = true;
+  showModal(
+    "Delete this image and its label file?\n\n" + ((S && S.name) || ""),
+    "<div class='modal-actions'><button id='delYes' class='danger'>Delete (Enter)</button>" +
+    "<button id='delNo'>Cancel (Esc)</button></div>"
+  );
+  document.getElementById("modalOk").classList.add("hidden");
+  document.getElementById("delYes").onclick = () => { closeDelConfirm(); doDelete(); };
+  document.getElementById("delNo").onclick = closeDelConfirm;
+}
+document.getElementById("delBtn").onclick = () => {
+  if (!S || S.index < 0) return;
+  if (document.getElementById("delWarnChk").checked) openDelConfirm();
+  else doDelete();
+};
 document.getElementById("statsBtn").onclick = () => api("/api/stats").then((j) => showModal(j.text));
 function parentDir(p) {
   if (!p) return "";
@@ -717,51 +744,37 @@ function parentDir(p) {
   if (i === 2 && s[1] === ":") return s.slice(0, 3);
   return s.slice(0, i);
 }
-function promptAnnotations(st) {
-  const start = parentDir(st.images_dir) || st.images_dir || "";
-  showModal(
-    "Images folder set.\n\nPlease choose the annotations folder.\n" +
-    "Click OK to open the folder picker (starts one folder above the images directory)."
-  );
-  const ok = document.getElementById("modalOk");
-  ok.onclick = () => {
-    hideModal();
-    ok.onclick = hideModal;
-    post("/api/browse", { kind: "labels", initial: start })
-      .then((st2) => {
-        applyState(st2);
-        afterLabelsFolder(st2);
-      })
-      .catch((err) => { hideLoading(); showModal(err.message || String(err)); });
-  };
+let appBusy = false;
+function setBusy(on) {
+  appBusy = on;
+  document.getElementById("busyBlock").classList.toggle("hidden", !on);
 }
 function applyDir(kind, path) {
+  if (appBusy) return;
+  setBusy(true);
+  showLoading(kind === "images" ? "Loading images folder…" : "Starting dataset scan…");
   post("/api/set_dir", { kind, path })
     .then((st) => {
+      setBusy(false);
       applyState(st);
-      if (kind === "images" && st.images_dir) promptAnnotations(st);
-      else afterLabelsFolder(st);
-    })
-    .catch((err) => { hideLoading(); showModal(err.message || String(err)); });
-}
-document.getElementById("browseImages").onclick = () => {
-  post("/api/browse", { kind: "images" })
-    .then((st) => {
-      applyState(st);
-      if (st.folder_picked && st.images_dir) promptAnnotations(st);
-    })
-    .catch((err) => { hideLoading(); showModal(err.message || String(err)); });
-};
-document.getElementById("browseLabels").onclick = () => {
-  const start = parentDir(S && S.images_dir) || (S && S.labels_dir) || "";
-  post("/api/browse", { kind: "labels", initial: start || undefined })
-    .then((st) => {
-      applyState(st);
-      if (st.folder_picked) afterLabelsFolder(st);
+      if (kind === "labels") afterLabelsFolder(st);
       else hideLoading();
     })
-    .catch((err) => { hideLoading(); showModal(err.message || String(err)); });
-};
+    .catch((err) => { setBusy(false); hideLoading(); showModal(err.message || String(err)); });
+}
+function browseDir(kind, initial) {
+  if (appBusy) return;
+  setBusy(true);
+  post("/api/browse", { kind, initial: initial || undefined })
+    .then((j) => {
+      setBusy(false);
+      if (j.path) applyDir(kind, j.path);
+    })
+    .catch((err) => { setBusy(false); showModal(err.message || String(err)); });
+}
+document.getElementById("browseImages").onclick = () => browseDir("images");
+document.getElementById("browseLabels").onclick = () =>
+  browseDir("labels", parentDir(S && S.images_dir) || (S && S.labels_dir) || "");
 document.getElementById("applyImagesDir").onclick = () => applyDir("images", document.getElementById("dirImages").value);
 document.getElementById("applyLabelsDir").onclick = () => applyDir("labels", document.getElementById("dirLabels").value);
 document.getElementById("dirImages").addEventListener("keydown", (e) => { if (e.key === "Enter") document.getElementById("applyImagesDir").click(); });
@@ -1141,8 +1154,16 @@ function isTypingTarget(el) {
 }
 
 window.addEventListener("keydown", (e) => {
+  if (appBusy || !document.getElementById("loadingOverlay").classList.contains("hidden")) {
+    e.preventDefault();
+    return;
+  }
+  if (delConfirmOpen) {
+    if (e.key === "Enter") { e.preventDefault(); closeDelConfirm(); doDelete(); }
+    else if (e.key === "Escape") { e.preventDefault(); closeDelConfirm(); }
+    return;
+  }
   if (e.key === "Escape") {
-    if (!document.getElementById("loadingOverlay").classList.contains("hidden")) return;
     if (!document.getElementById("modal").classList.contains("hidden")) { hideModal(); return; }
     if (popupOpen()) { closeCropPopup(); return; }
     hideModal();

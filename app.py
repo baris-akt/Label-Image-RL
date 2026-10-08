@@ -26,7 +26,6 @@ import imagehash
 ROOT = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(ROOT, "data")
 TRACK_CACHE_DIR = os.path.join(DATA_DIR, "tracking_cache")
-LAST_FOLDERS_FILE = os.path.join(DATA_DIR, "last_folders.txt")
 
 IMAGES_DIR = ""
 LABELS_DIR = ""
@@ -63,7 +62,7 @@ CLUSTER_RADIUS = 8.0
 PHASH_SIZE = 16
 PHASH_BITS = PHASH_SIZE * PHASH_SIZE
 FEATURE_DIM = PHASH_BITS + 256
-CLUSTER_WORKERS = 8
+CLUSTER_WORKERS = max(2, min((os.cpu_count() or 8) - 5, 12))
 CROP_ZOOM = 3.0
 CROP_SMALL_FRAC = 0.07
 CROP_SMALL_VIEW = 0.25
@@ -82,6 +81,9 @@ all_image_list = []
 image_list = []
 current_index = -1
 images_no_txt = 0
+images_empty_txt = 0
+images_scanned = 0
+folder_busy = False
 class_filter_id = None
 sort_mode = "name"
 size_filter_on = False
@@ -120,24 +122,6 @@ def class_name(cls_idx):
     if 0 <= i < len(CLASS_NAMES) and str(CLASS_NAMES[i]).strip():
         return str(CLASS_NAMES[i]).strip()
     return "Unnamed-Cls%d" % i
-
-
-def save_last_folders():
-    os.makedirs(DATA_DIR, exist_ok=True)
-    with open(LAST_FOLDERS_FILE, "w", encoding="utf-8") as f:
-        f.write("%s\n%s\n" % (IMAGES_DIR, LABELS_DIR))
-
-
-def load_last_folders():
-    global IMAGES_DIR, LABELS_DIR
-    if not os.path.isfile(LAST_FOLDERS_FILE):
-        return
-    with open(LAST_FOLDERS_FILE, "r", encoding="utf-8", errors="ignore") as f:
-        lines = [ln.rstrip("\n\r") for ln in f.readlines()]
-    if len(lines) >= 1 and lines[0] and os.path.isdir(lines[0]):
-        IMAGES_DIR = lines[0]
-    if len(lines) >= 2 and lines[1] and os.path.isdir(lines[1]):
-        LABELS_DIR = lines[1]
 
 
 def classes_txt_path(folder=None):
@@ -365,7 +349,8 @@ def start_dataset_index():
     def scan_one(p):
         boxes = []
         lp = os.path.join(labels_dir, Path(p).stem + ".txt")
-        if os.path.isfile(lp):
+        has_txt = os.path.isfile(lp)
+        if has_txt:
             with open(lp, "r", encoding="utf-8") as f:
                 for line in f:
                     parts = line.strip().split()
@@ -395,19 +380,26 @@ def start_dataset_index():
                 })
                 if area > mx:
                     mx = area
-        return p, entries, mx, {int(b["cls"]) for b in boxes}, wh
+        return p, entries, mx, {int(b["cls"]) for b in boxes}, wh, has_txt
 
     def work():
         global indexing, box_size_cache_ready, index_cur, index_total, index_msg, index_error, crop_refs
+        global all_image_list, images_no_txt, images_empty_txt, images_scanned
         try:
             index_total = len(paths)
             done = 0
+            no_txt = 0
+            empty_txt = 0
             with ThreadPoolExecutor(max_workers=n_workers) as ex:
                 futs = [ex.submit(scan_one, p) for p in paths]
                 for fut in as_completed(futs):
                     if my_gen != index_gen:
                         break
-                    p, entries, mx, classes, wh = fut.result()
+                    p, entries, mx, classes, wh, has_txt = fut.result()
+                    if not has_txt:
+                        no_txt += 1
+                    elif not entries:
+                        empty_txt += 1
                     box_size_cache[p] = entries
                     path_box_size[p] = mx
                     path_classes[p] = classes
@@ -419,10 +411,15 @@ def start_dataset_index():
                         index_msg = "Scanning labels and box sizes... %d / %d" % (done, index_total)
             if my_gen != index_gen:
                 return
+            images_scanned = len(paths)
+            images_no_txt = no_txt
+            images_empty_txt = empty_txt
+            all_image_list = [p for p in paths if box_size_cache.get(p)]
             rebuild_size_order()
             box_size_cache_ready = True
+            apply_class_filter()
             crop_refs = []
-            index_msg = "Dataset index ready (%d images)" % len(paths)
+            index_msg = "Scan finished"
         except Exception as e:
             if my_gen == index_gen:
                 index_error = str(e)
@@ -641,21 +638,11 @@ def push_undo(path, boxes):
 def reload_images():
     global all_image_list, undo_stack, dataset_clustered, cluster_groups, cluster_ordered_paths, crop_refs
     global size_filter_on, path_box_size, path_size_pct, size_ordered_paths, path_wh, crop_gen
-    global box_size_cache, box_size_cache_ready, crop_cluster_id, images_no_txt
-    raw = list_images(IMAGES_DIR)
+    global box_size_cache, box_size_cache_ready, crop_cluster_id, images_no_txt, images_empty_txt, images_scanned
+    all_image_list = list_images(IMAGES_DIR)
     images_no_txt = 0
-    if LABELS_DIR and os.path.isdir(LABELS_DIR):
-        kept = []
-        for p in raw:
-            lp = label_path(p)
-            if not os.path.isfile(lp):
-                images_no_txt += 1
-                continue
-            if load_boxes(p):
-                kept.append(p)
-        all_image_list = kept
-    else:
-        all_image_list = raw
+    images_empty_txt = 0
+    images_scanned = 0
     undo_stack = []
     dataset_clustered = False
     cluster_groups = []
@@ -845,22 +832,33 @@ def api_image():
 
 
 def apply_folder(kind, d):
-    global IMAGES_DIR, LABELS_DIR
-    if kind == "images":
-        IMAGES_DIR = d
-        save_last_folders()
+    global IMAGES_DIR, LABELS_DIR, folder_busy
+    folder_busy = True
+    try:
+        if kind == "images":
+            IMAGES_DIR = d
+            LABELS_DIR = ""
+        else:
+            LABELS_DIR = d
         reload_images()
-    else:
-        LABELS_DIR = d
-        save_last_folders()
-        reload_images()
-    msg = None
-    if tracking_enabled:
-        msg = load_or_create_tracking()
+        msg = None
+        if tracking_enabled:
+            msg = load_or_create_tracking()
+    finally:
+        folder_busy = False
     out = state_payload()
     out["track_info"] = msg
-    out["index_started"] = indexing or box_size_cache_ready
     return out
+
+
+def busy_error():
+    if folder_busy:
+        return "Still loading a folder. Please wait."
+    if indexing:
+        return "Dataset scan in progress. Please wait."
+    if clustering:
+        return "Clustering in progress. Please wait."
+    return None
 
 
 @app.route("/api/folders", methods=["POST"])
@@ -873,7 +871,6 @@ def api_folders():
         IMAGES_DIR = img
     if lab and os.path.isdir(lab):
         LABELS_DIR = lab
-    save_last_folders()
     reload_images()
     msg = None
     if tracking_enabled:
@@ -939,6 +936,9 @@ def pick_directory(title, initial):
 
 @app.route("/api/browse", methods=["POST"])
 def api_browse():
+    err = busy_error()
+    if err:
+        return jsonify({"error": err}), 409
     data = request.get_json(force=True) or {}
     kind = data.get("kind")
     initial = (data.get("initial") or "").strip()
@@ -959,15 +959,14 @@ def api_browse():
             "error": "No folder picker available. Paste the folder path in File and press Set. "
             "On Ubuntu you can also: sudo apt install zenity   or   sudo apt install python3-tk"
         }), 500
-    if not d:
-        return jsonify(state_payload())
-    out = apply_folder(kind, d)
-    out["folder_picked"] = True
-    return jsonify(out)
+    return jsonify({"path": d or ""})
 
 
 @app.route("/api/set_dir", methods=["POST"])
 def api_set_dir():
+    err = busy_error()
+    if err:
+        return jsonify({"error": err}), 409
     data = request.get_json(force=True) or {}
     kind = data.get("kind")
     path = (data.get("path") or "").strip().strip('"').strip("'")
@@ -1272,10 +1271,18 @@ def api_stats():
             i = int(b["cls"])
             if 0 <= i < len(counts):
                 counts[i] += 1
-    lines = [
-        "Images: %d" % len(image_list),
-        "Images with no txt: %d" % images_no_txt,
-        "Boxes: %d" % n_box,
+    lines = []
+    if images_scanned:
+        lines += [
+            "Images in folder: %d" % images_scanned,
+            "Images with boxes: %d" % (images_scanned - images_no_txt - images_empty_txt),
+            "Images with no txt: %d" % images_no_txt,
+            "Images with empty txt (no boxes): %d" % images_empty_txt,
+            "",
+        ]
+    lines += [
+        "Images shown: %d" % len(image_list),
+        "Total boxes: %d" % n_box,
         "",
     ]
     for i, n in enumerate(counts):

@@ -440,9 +440,17 @@ body.light .filter-panel {
   max-width: 520px;
 }
 .modal-box pre { white-space: pre-wrap; margin: 0 0 12px; }
+.modal-actions { display: flex; gap: 8px; justify-content: flex-end; }
 .modal-box input { width: 100%; margin: 4px 0; }
 .cls-btns { display: flex; flex-direction: column; gap: 6px; margin-bottom: 10px; }
 .cls-btns button { text-align: left; font-weight: 600; }
+.busy-block {
+  position: fixed;
+  inset: 0;
+  z-index: 89;
+  background: transparent;
+  cursor: wait;
+}
 .loading-overlay {
   position: fixed;
   inset: 0;

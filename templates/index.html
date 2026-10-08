@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>LabelImage</title>
-  <link rel="stylesheet" href="/static/css/style.css?v=17" />
+  <link rel="stylesheet" href="/static/css/style.css?v=19" />
 </head>
 <body>
   <header class="topbar">
@@ -46,6 +46,7 @@
           <label>New box class<select id="newCls"></select></label>
           <button id="setClasses">Set classes</button>
           <label class="row"><input id="darkChk" type="checkbox" checked /> Dark mode</label>
+          <label class="row"><input id="delWarnChk" type="checkbox" checked /> Delete Warning Pop-Up</label>
         </div>
       </details>
       <details>
@@ -188,6 +189,7 @@
       <button id="modalOk">OK</button>
     </div>
   </div>
+  <div id="busyBlock" class="busy-block hidden"></div>
   <div id="loadingOverlay" class="loading-overlay hidden">
     <div class="loading-box">
       <div class="loading-spinner"></div>
@@ -198,6 +200,6 @@
       <div id="loadingPct" class="loading-pct"></div>
     </div>
   </div>
-  <script src="/static/js/app.js?v=36"></script>
+  <script src="/static/js/app.js?v=39"></script>
 </body>
 </html>
