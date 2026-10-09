@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>LabelImage</title>
-  <link rel="stylesheet" href="/static/css/style.css?v=20" />
+  <link rel="stylesheet" href="/static/css/style.css?v=21" />
 </head>
 <body>
   <header class="topbar">
@@ -23,6 +23,8 @@
             <button id="browseLabels" type="button">Browse</button>
             <button id="applyLabelsDir" type="button">Set</button>
           </div>
+          <button id="addObserved" type="button">Add Observed Annotations</button>
+          <div id="obsList" class="obs-list"></div>
         </div>
       </details>
       <details>
@@ -47,6 +49,7 @@
           <button id="setClasses">Set classes</button>
           <label class="row"><input id="darkChk" type="checkbox" checked /> Dark mode</label>
           <label class="row"><input id="delWarnChk" type="checkbox" checked /> Delete Warning Pop-Up</label>
+          <label class="row"><input id="skipObsOnlyChk" type="checkbox" checked /> Skip only Observed Annotation Images</label>
         </div>
       </details>
       <details>
@@ -122,6 +125,7 @@
         <button id="removeBtn" class="mode">Remove (R)</button>
         <button id="placeBtn" class="mode">Place Box (Q)</button>
         <button id="statsBtn">Stats</button>
+        <span id="obsToggles" class="obs-toggles"></span>
         <span class="grow"></span>
         <button id="checkedBtn" class="hidden checked">Image Checked (Tab)</button>
         <button id="fitBtn">Fit Image (F)</button>
@@ -175,6 +179,7 @@
         <button id="cropPEditBtn" class="mode">Edit (E)</button>
         <button id="cropPRemoveBtn" class="mode">Remove (R)</button>
         <button id="cropPPlaceBtn" class="mode">Place Box (Q)</button>
+        <span id="cropObsToggles" class="obs-toggles"></span>
         <span class="grow"></span>
         <button id="cropPDelBtn" class="danger">Delete Image (Del)</button>
       </div>
@@ -206,6 +211,6 @@
       <div id="loadingPct" class="loading-pct"></div>
     </div>
   </div>
-  <script src="/static/js/app.js?v=43"></script>
+  <script src="/static/js/app.js?v=47"></script>
 </body>
 </html>

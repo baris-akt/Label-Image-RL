@@ -56,6 +56,12 @@ def class_hex(cls_idx, sat=None, val=None):
     r, g, b = colorsys.hsv_to_rgb(h, float(sat), float(val))
     return "#%02x%02x%02x" % (int(round(r * 255)), int(round(g * 255)), int(round(b * 255)))
 
+def opposite_hex(cls_idx):
+    s, v = class_sv(cls_idx)
+    h = ((HUE_ORDER[int(cls_idx) % HUE_BINS] + HUE_BINS // 2) % HUE_BINS) / float(HUE_BINS)
+    r, g, b = colorsys.hsv_to_rgb(h, float(s), float(v))
+    return "#%02x%02x%02x" % (int(round(r * 255)), int(round(g * 255)), int(round(b * 255)))
+
 IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
 PLACE_W, PLACE_H = 50, 50
 BOX_THICKNESS, LABEL_SIZE = 2, 10
@@ -125,6 +131,10 @@ tracking_enabled = False
 track_status = {}
 crop_refs = []
 crop_cluster_id = None
+observers = []
+OBS_COLORS = ["#ffff00", "#ff00ff", "#00ffff", "#00ff00", "#0000ff"]
+folder_image_list = []
+skip_obs_only = True
 
 
 def class_name(cls_idx):
@@ -230,7 +240,7 @@ def write_boxes(path, boxes):
             f.write("%d %.6f %.6f %.6f %.6f\n" % (b["cls"], b["cx"], b["cy"], b["w"], b["h"]))
     crop_refs = []
     touched_paths.add(path)
-    if not boxes:
+    if not boxes and (skip_obs_only or not has_observed(path)):
         drop_from_lists(path)
         return
     if dataset_clustered:
@@ -350,6 +360,98 @@ def clear_dataset_index():
     index_error = ""
 
 
+def read_yolo(txt):
+    boxes = []
+    if not os.path.isfile(txt):
+        return None
+    with open(txt, "r", encoding="utf-8") as f:
+        for line in f:
+            parts = line.strip().split()
+            if len(parts) < 5:
+                continue
+            boxes.append({"cls": max(0, int(float(parts[0]))), "cx": float(parts[1]),
+                          "cy": float(parts[2]), "w": float(parts[3]), "h": float(parts[4])})
+    return boxes
+
+
+def has_observed(path):
+    return any(o["boxes"].get(path) for o in observers)
+
+
+def keep_image(path):
+    return bool(box_size_cache.get(path)) or (not skip_obs_only and has_observed(path))
+
+
+def scan_observers(obs_list, paths, my_gen):
+    global index_cur, index_total, index_msg
+    for o in obs_list:
+        o["boxes"] = {}
+        o["n_txt"] = 0
+    if not obs_list or not paths:
+        return
+    index_cur = 0
+    index_total = len(paths)
+    index_msg = "Scanning observed annotations..."
+
+    def scan_one(p):
+        stem = Path(p).stem + ".txt"
+        return p, [read_yolo(os.path.join(o["dir"], stem)) for o in obs_list]
+
+    done = 0
+    with ThreadPoolExecutor(max_workers=INDEX_WORKERS) as ex:
+        for p, found in ex.map(scan_one, paths):
+            if my_gen != index_gen:
+                return
+            for o, boxes in zip(obs_list, found):
+                if boxes is not None:
+                    o["n_txt"] += 1
+                    if boxes:
+                        o["boxes"][p] = boxes
+            done += 1
+            index_cur = done
+            if done == 1 or done % 25 == 0 or done == index_total:
+                index_msg = "Scanning observed annotations... %d / %d" % (done, index_total)
+
+
+def rebuild_visible_images():
+    global all_image_list
+    all_image_list = [p for p in folder_image_list if keep_image(p)]
+    for p in all_image_list:
+        base_boxes.setdefault(p, [box_key(b) for b in box_size_cache.get(p, [])])
+    rebuild_size_order()
+    apply_class_filter(current_path())
+    if dataset_clustered:
+        rebuild_cluster_order()
+
+
+def start_observed_scan():
+    global indexing, index_error, index_gen, index_msg
+    index_gen += 1
+    my_gen = index_gen
+    indexing = True
+    index_error = ""
+    index_msg = "Scanning observed annotations..."
+
+    def work():
+        global indexing, index_error, index_msg, crop_refs
+        try:
+            scan_observers(observers, list(folder_image_list), my_gen)
+            if my_gen != index_gen:
+                return
+            rebuild_visible_images()
+            crop_refs = []
+            index_msg = "Scan finished"
+        except Exception as e:
+            if my_gen == index_gen:
+                index_error = str(e)
+                index_msg = "Observed scan failed"
+        finally:
+            if my_gen == index_gen:
+                indexing = False
+
+    threading.Thread(target=work, daemon=True).start()
+
+
 def folders_ready():
     return bool(IMAGES_DIR and LABELS_DIR and os.path.isdir(IMAGES_DIR) and os.path.isdir(LABELS_DIR) and all_image_list)
 
@@ -439,10 +541,14 @@ def start_dataset_index():
             images_scanned = len(paths)
             images_no_txt = no_txt
             images_empty_txt = empty_txt
-            all_image_list = [p for p in paths if box_size_cache.get(p)]
+            if observers:
+                scan_observers(observers, paths, my_gen)
+                if my_gen != index_gen:
+                    return
+            all_image_list = [p for p in paths if keep_image(p)]
             base_boxes.clear()
             for p in all_image_list:
-                base_boxes[p] = [box_key(b) for b in box_size_cache[p]]
+                base_boxes[p] = [box_key(b) for b in box_size_cache.get(p, [])]
             touched_paths.clear()
             deleted_paths.clear()
             rebuild_size_order()
@@ -726,7 +832,9 @@ def reload_images():
     global all_image_list, undo_stack, dataset_clustered, cluster_groups, cluster_ordered_paths, crop_refs
     global size_filter_on, path_box_size, path_size_pct, size_ordered_paths, path_wh, crop_gen
     global box_size_cache, box_size_cache_ready, crop_cluster_id, images_no_txt, images_empty_txt, images_scanned
+    global folder_image_list
     all_image_list = list_images(IMAGES_DIR)
+    folder_image_list = list(all_image_list)
     images_no_txt = 0
     images_empty_txt = 0
     images_scanned = 0
@@ -858,6 +966,10 @@ def state_payload():
     return {
         "images_dir": IMAGES_DIR,
         "labels_dir": LABELS_DIR,
+        "observers": [{"id": o["id"], "name": o["name"], "dir": o["dir"], "color": o["color"],
+                       "color2": o["color2"]} for o in observers],
+        "skip_obs_only": skip_obs_only,
+        "obs_boxes": [{"id": o["id"], "boxes": o["boxes"].get(path, [])} for o in observers] if path else [],
         "index": current_index,
         "total": len(image_list),
         "name": Path(path).name if path else "-",
@@ -931,6 +1043,7 @@ def apply_folder(kind, d):
         if kind == "images":
             IMAGES_DIR = d
             LABELS_DIR = ""
+            observers.clear()
         else:
             LABELS_DIR = d
         reload_images()
@@ -1041,6 +1154,8 @@ def api_browse():
         initial = os.path.expanduser("~")
     if kind == "images":
         title = "Select images folder"
+    elif kind == "observed":
+        title = "Select observed annotations folder"
     else:
         title = "Select annotations folder"
     try:
@@ -1068,6 +1183,65 @@ def api_set_dir():
     if not path or not os.path.isdir(path):
         return jsonify({"error": "Folder not found: %s" % path}), 400
     return jsonify(apply_folder(kind, os.path.abspath(path)))
+
+
+@app.route("/api/observed/add", methods=["POST"])
+def api_observed_add():
+    err = busy_error()
+    if err:
+        return jsonify({"error": err}), 409
+    if not box_size_cache_ready or not folder_image_list:
+        return jsonify({"error": "Load images and annotations folders first and wait for the scan."}), 400
+    data = request.get_json(force=True) or {}
+    name = (data.get("name") or "").strip()
+    d = (data.get("dir") or "").strip().strip('"').strip("'")
+    if not name:
+        return jsonify({"error": "Enter a text for the observed annotations."}), 400
+    if not d or not os.path.isdir(d):
+        return jsonify({"error": "Folder not found: %s" % d}), 400
+    used = {o["slot"] for o in observers}
+    slot = 0
+    while slot in used:
+        slot += 1
+    observers.append({
+        "id": max([o["id"] for o in observers] + [-1]) + 1,
+        "slot": slot,
+        "name": name,
+        "dir": os.path.abspath(d),
+        "color": OBS_COLORS[slot % len(OBS_COLORS)],
+        "color2": OBS_COLORS[slot % len(OBS_COLORS)],
+        "boxes": {},
+        "n_txt": 0,
+    })
+    start_observed_scan()
+    return jsonify(state_payload())
+
+
+@app.route("/api/observed/skip", methods=["POST"])
+def api_observed_skip():
+    global skip_obs_only, crop_refs
+    err = busy_error()
+    if err:
+        return jsonify({"error": err}), 409
+    skip_obs_only = bool((request.get_json(force=True) or {}).get("skip", True))
+    if box_size_cache_ready:
+        rebuild_visible_images()
+    crop_refs = []
+    return jsonify(state_payload())
+
+
+@app.route("/api/observed/remove", methods=["POST"])
+def api_observed_remove():
+    global crop_refs
+    err = busy_error()
+    if err:
+        return jsonify({"error": err}), 409
+    oid = (request.get_json(force=True) or {}).get("id")
+    observers[:] = [o for o in observers if o["id"] != oid]
+    if box_size_cache_ready:
+        rebuild_visible_images()
+    crop_refs = []
+    return jsonify(state_payload())
 
 
 @app.route("/api/index/build", methods=["POST"])
@@ -1154,6 +1328,10 @@ def api_delete():
     except OSError as e:
         return jsonify({"error": str(e)}), 400
     drop_from_lists(path)
+    if path in folder_image_list:
+        folder_image_list.remove(path)
+    for o in observers:
+        o["boxes"].pop(path, None)
     deleted_paths.add(path)
     touched_paths.add(path)
     if tracking_enabled:
@@ -1466,15 +1644,18 @@ def api_stats():
     lines = []
     if images_scanned:
         folder_now = images_scanned - n_del_imgs
-        with_boxes = len(all_image_list)
+        with_boxes = sum(1 for p in all_image_list if box_size_cache.get(p))
         img_chg = parts([(edited_imgs, "edited image", "#f5c542"), (n_del_imgs, "deleted image", "#ff5c5c")])
         lines += [
             "Images in folder: %d%s" % (folder_now, img_chg),
             "Images with boxes: %d" % with_boxes,
             "Images with no txt: %d" % images_no_txt,
-            "Images with empty txt (no boxes): %d" % (folder_now - images_no_txt - with_boxes),
-            "",
+            "Images with empty txt (no boxes): %d" % max(0, folder_now - images_no_txt - with_boxes),
         ]
+        if observers:
+            obs_only = sum(1 for p in folder_image_list if not box_size_cache.get(p) and has_observed(p))
+            lines.append("Images with only observed boxes: %d (%s)" % (obs_only, "skipped" if skip_obs_only else "shown"))
+        lines.append("")
     lines += [
         "Images shown: %d%s" % (len(image_list), parts([(n_del_imgs, "deleted", "#ff5c5c")])),
         "Total boxes: %d%s" % (n_box, chg()),
@@ -1482,6 +1663,21 @@ def api_stats():
     ]
     for i, n in enumerate(counts):
         lines.append("%d %s: %d%s" % (i, html.escape(class_name(i)), n, chg(i)))
+    for o in observers:
+        oc = [0] * len(CLASS_NAMES)
+        n_obs = 0
+        for p, bl in o["boxes"].items():
+            for b in bl:
+                n_obs += 1
+                if 0 <= int(b["cls"]) < len(oc):
+                    oc[int(b["cls"])] += 1
+        lines += [
+            "",
+            "<span style='color:%s'>Observed \"%s\"</span> (%s):" % (o["color"], html.escape(o["name"]), html.escape(o["dir"])),
+            "  Images with txt: %d   Images with boxes: %d   Total boxes: %d" % (o["n_txt"], len(o["boxes"]), n_obs),
+        ]
+        for i, n in enumerate(oc):
+            lines.append("  %d %s: %d" % (i, html.escape(class_name(i)), n))
     out = "\n".join(lines)
     return jsonify({"html": out, "text": re.sub(r"<[^>]+>", "", out)})
 

@@ -28,7 +28,10 @@ function showModal(text, extraHtml) {
   document.getElementById("modalExtra").innerHTML = extraHtml || "";
   document.getElementById("modal").classList.remove("hidden");
 }
-function hideModal() { document.getElementById("modal").classList.add("hidden"); }
+function hideModal() {
+  document.getElementById("modal").classList.add("hidden");
+  document.getElementById("modalOk").classList.remove("hidden");
+}
 document.getElementById("modalOk").onclick = hideModal;
 function showLoading(text, pct) {
   document.getElementById("loadingText").textContent = text || "Loading…";
@@ -145,6 +148,8 @@ function applyState(st, keepView) {
   if (di && document.activeElement !== di) di.value = st.images_dir || "";
   if (dl && document.activeElement !== dl) dl.value = st.labels_dir || "";
   updateMultiBoxWarn();
+  document.getElementById("skipObsOnlyChk").checked = st.skip_obs_only !== false;
+  renderObservers(st);
   loadImages(keepView);
 }
 
@@ -344,40 +349,15 @@ function draw() {
   if (imgF && dual === "v") { oy2 = imgH + DUAL_GAP; ctx.drawImage(imgF, 0, oy2, imgW, imgH); }
   const offs = [[0, 0]];
   if (imgF && dual) offs.push([ox2, oy2]);
-  const showB = document.getElementById("showBoxes").checked;
-  const showL = document.getElementById("showLabels").checked;
-  const th = S.box_thickness / scale;
-  offs.forEach(([dx, dy]) => {
-    (S.boxes || []).forEach((b, i) => {
-      const [x1, y1, x2, y2] = xyxy(b);
-      if (showB) {
-        if (i === selected && mode === "edit") {
-          ctx.setLineDash([]);
-          ctx.strokeStyle = "#000";
-          ctx.lineWidth = 5 / scale;
-          ctx.strokeRect(x1 + dx, y1 + dy, x2 - x1, y2 - y1);
-          ctx.strokeStyle = "#fff";
-          ctx.lineWidth = 2 / scale;
-          ctx.strokeRect(x1 + dx, y1 + dy, x2 - x1, y2 - y1);
-        } else {
-          ctx.strokeStyle = S.class_colors[b.cls] || "#0f0";
-          ctx.lineWidth = th;
-          ctx.strokeRect(x1 + dx, y1 + dy, x2 - x1, y2 - y1);
-        }
-      }
-      if (showL) {
-        ctx.fillStyle = S.class_colors[b.cls] || "#0f0";
-        ctx.font = (S.label_size / scale) + "px Arial";
-        ctx.fillText(S.classes[b.cls] || String(b.cls), x1 + dx, Math.max(dy, y1 + dy - 4));
-      }
-    });
-  });
+  drawAllBoxes(ctx, scale, offs,
+    document.getElementById("showBoxes").checked, document.getElementById("showLabels").checked);
 }
 
 function saveBoxes(changed) {
+  const oldPath = S && S.path;
   return post("/api/boxes", { boxes: S.boxes, changed: !!changed }).then((st) => {
     if (changed) cropPopupDirty = true;
-    applyState(st, true);
+    applyState(st, popupOpen() || st.path === oldPath);
     if (popupOpen()) drawCropPopup();
   });
 }
@@ -791,6 +771,143 @@ document.getElementById("applyImagesDir").onclick = () => applyDir("images", doc
 document.getElementById("applyLabelsDir").onclick = () => applyDir("labels", document.getElementById("dirLabels").value);
 document.getElementById("dirImages").addEventListener("keydown", (e) => { if (e.key === "Enter") document.getElementById("applyImagesDir").click(); });
 document.getElementById("dirLabels").addEventListener("keydown", (e) => { if (e.key === "Enter") document.getElementById("applyLabelsDir").click(); });
+
+const obsHidden = {};
+function escHtml(s) {
+  return String(s == null ? "" : s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+function renderObservers(st) {
+  const obs = (st && st.observers) || [];
+  const swatch = (o) => "<span class='obs-swatch' style='border-color:" + o.color + ";background:" + o.color2 + "'></span>";
+  document.getElementById("obsList").innerHTML = obs.map((o) =>
+    "<div class='obs-row'>" + swatch(o) + "<span class='obs-name'>" + escHtml(o.name) + "</span>" +
+    "<span class='obs-dir'>" + escHtml(o.dir) + "</span>" +
+    "<button type='button' class='danger' data-obs-remove='" + o.id + "'>Remove</button></div>"
+  ).join("");
+  document.querySelectorAll("[data-obs-remove]").forEach((b) => {
+    b.onclick = () => {
+      if (appBusy) return;
+      setBusy(true);
+      post("/api/observed/remove", { id: +b.dataset.obsRemove })
+        .then((st2) => { setBusy(false); applyState(st2, true); if (popupOpen()) drawCropPopup(); })
+        .catch((err) => { setBusy(false); showModal(err.message || String(err)); });
+    };
+  });
+  const toggles = obs.map((o) =>
+    "<label class='row' style='color:" + o.color + "'><input type='checkbox' data-obs-toggle='" + o.id + "'" +
+    (obsHidden[o.id] ? "" : " checked") + " />" + escHtml(o.name) + "</label>"
+  ).join("");
+  ["obsToggles", "cropObsToggles"].forEach((id) => { document.getElementById(id).innerHTML = toggles; });
+  document.querySelectorAll("[data-obs-toggle]").forEach((c) => {
+    c.onchange = () => {
+      obsHidden[c.dataset.obsToggle] = !c.checked;
+      document.querySelectorAll("[data-obs-toggle='" + c.dataset.obsToggle + "']").forEach((o) => { o.checked = c.checked; });
+      draw();
+      if (popupOpen()) drawCropPopup();
+    };
+  });
+}
+const SAME_BOX_IOU = 0.9;
+function boxIou(a, b) {
+  const ix = Math.max(0, Math.min(a.cx + a.w / 2, b.cx + b.w / 2) - Math.max(a.cx - a.w / 2, b.cx - b.w / 2));
+  const iy = Math.max(0, Math.min(a.cy + a.h / 2, b.cy + b.h / 2) - Math.max(a.cy - a.h / 2, b.cy - b.h / 2));
+  const inter = ix * iy;
+  const uni = a.w * a.h + b.w * b.h - inter;
+  return uni > 0 ? inter / uni : 0;
+}
+function drawAllBoxes(g, s, offs, showB, showL) {
+  const clsName = (c) => (S.classes && S.classes[c]) || String(c);
+  const groups = (S.boxes || []).map((b, i) => ({
+    box: b, main: i, merge: showB, obs: null,
+    labels: showL ? [{ text: clsName(b.cls), color: (S.class_colors && S.class_colors[b.cls]) || "#0f0" }] : [],
+  }));
+  (S.obs_boxes || []).forEach((ob) => {
+    const o = (S.observers || []).find((x) => x.id === ob.id);
+    if (!o || obsHidden[o.id]) return;
+    ob.boxes.forEach((b) => {
+      const label = { text: o.name + "-" + clsName(b.cls), color: o.color };
+      const hit = groups.find((gr) => gr.merge && boxIou(gr.box, b) >= SAME_BOX_IOU);
+      if (hit) {
+        hit.labels.push(label);
+        if (hit.main == null) hit.obs = o;
+      } else {
+        groups.push({ box: b, main: null, merge: true, obs: o, labels: [label] });
+      }
+    });
+  });
+  const th = (S.box_thickness || 2) / s;
+  g.font = ((S.label_size || 14) / s) + "px Arial";
+  offs.forEach(([dx, dy]) => {
+    groups.forEach((gr) => {
+      const [x1, y1, x2, y2] = xyxy(gr.box);
+      const rx = x1 + dx, ry = y1 + dy, rw = x2 - x1, rh = y2 - y1;
+      g.setLineDash([]);
+      if (gr.main != null) {
+        if (showB) {
+          if (gr.main === selected && mode === "edit") {
+            g.strokeStyle = "#000"; g.lineWidth = 5 / s; g.strokeRect(rx, ry, rw, rh);
+            g.strokeStyle = "#fff"; g.lineWidth = 2 / s; g.strokeRect(rx, ry, rw, rh);
+          } else {
+            g.strokeStyle = (S.class_colors && S.class_colors[gr.box.cls]) || "#0f0";
+            g.lineWidth = th;
+            g.strokeRect(rx, ry, rw, rh);
+          }
+        }
+      } else {
+        g.setLineDash([6 / s, 4 / s]);
+        g.strokeStyle = gr.obs.color; g.lineWidth = th; g.strokeRect(rx, ry, rw, rh);
+        g.setLineDash([]);
+      }
+      let tx = rx;
+      const ty = Math.max(dy, ry - 4);
+      gr.labels.forEach((lab, k) => {
+        const t = (k ? "  " : "") + lab.text;
+        g.fillStyle = lab.color;
+        g.fillText(t, tx, ty);
+        tx += g.measureText(t).width;
+      });
+    });
+  });
+}
+function addObservedFromForm() {
+  const name = document.getElementById("obsName").value.trim();
+  const dir = document.getElementById("obsDir").value.trim();
+  if (!name || !dir) { document.getElementById("obsErr").textContent = "Enter a text and a folder."; return; }
+  hideModal();
+  setBusy(true);
+  showLoading("Scanning observed annotations…", 0);
+  post("/api/observed/add", { name, dir })
+    .then((st) => { setBusy(false); applyState(st, true); pollDatasetIndex(); })
+    .catch((err) => { setBusy(false); hideLoading(); showModal(err.message || String(err)); });
+}
+document.getElementById("skipObsOnlyChk").onchange = () => {
+  const el = document.getElementById("skipObsOnlyChk");
+  post("/api/observed/skip", { skip: el.checked })
+    .then((st) => { applyState(st); if (isCropPage()) resetAndLoadCrops(cropShowCount()); })
+    .catch((err) => { el.checked = !el.checked; showModal(err.message || String(err)); });
+};
+document.getElementById("addObserved").onclick = () => {
+  if (appBusy) return;
+  showModal("Add Observed Annotations (read-only)",
+    "<div class='obs-form'>" +
+    "<label>Text<input id='obsName' placeholder='e.g. Found GT' /></label>" +
+    "<label>Folder<span class='inline'><input id='obsDir' placeholder='paste folder path' style='width:320px' />" +
+    "<button type='button' id='obsBrowse'>Browse</button></span></label>" +
+    "<div id='obsErr' class='menu-hint'></div>" +
+    "<div class='modal-actions'><button type='button' id='obsAdd'>Add</button><button type='button' id='obsCancel'>Cancel</button></div></div>");
+  document.getElementById("modalOk").classList.add("hidden");
+  document.getElementById("obsName").focus();
+  document.getElementById("obsCancel").onclick = hideModal;
+  document.getElementById("obsAdd").onclick = addObservedFromForm;
+  ["obsName", "obsDir"].forEach((id) => document.getElementById(id).addEventListener("keydown", (e) => {
+    if (e.key === "Enter") addObservedFromForm();
+  }));
+  document.getElementById("obsBrowse").onclick = () => {
+    post("/api/browse", { kind: "observed", initial: parentDir(S && S.labels_dir) || undefined })
+      .then((j) => { if (j.path) document.getElementById("obsDir").value = j.path; })
+      .catch((err) => { document.getElementById("obsErr").textContent = err.message || String(err); });
+  };
+};
 function saveSettings() {
   post("/api/settings", {
     box_thickness: +document.getElementById("boxTh").value,
@@ -943,36 +1060,10 @@ function drawCropPopup() {
   if (pImgF && pDual === "h") { ox2 = pW + DUAL_GAP; pCtx.drawImage(pImgF, ox2, 0, pW, pH); }
   if (pImgF && pDual === "v") { oy2 = pH + DUAL_GAP; pCtx.drawImage(pImgF, 0, oy2, pW, pH); }
   if (!S) return;
-  const showB = document.getElementById("cropPShowBoxes").checked;
-  const showL = document.getElementById("cropPShowLabels").checked;
-  const th = (S.box_thickness || 2) / pScale;
   const offs = [[0, 0]];
   if (pImgF && pDual) offs.push([ox2, oy2]);
-  offs.forEach(([dx, dy]) => {
-    (S.boxes || []).forEach((b, i) => {
-      const [x1, y1, x2, y2] = xyxy(b);
-      if (showB) {
-        if (i === selected && mode === "edit") {
-          pCtx.setLineDash([]);
-          pCtx.strokeStyle = "#000";
-          pCtx.lineWidth = 5 / pScale;
-          pCtx.strokeRect(x1 + dx, y1 + dy, x2 - x1, y2 - y1);
-          pCtx.strokeStyle = "#fff";
-          pCtx.lineWidth = 2 / pScale;
-          pCtx.strokeRect(x1 + dx, y1 + dy, x2 - x1, y2 - y1);
-        } else {
-          pCtx.strokeStyle = (S.class_colors && S.class_colors[b.cls]) || "#0f0";
-          pCtx.lineWidth = th;
-          pCtx.strokeRect(x1 + dx, y1 + dy, x2 - x1, y2 - y1);
-        }
-      }
-      if (showL) {
-        pCtx.fillStyle = (S.class_colors && S.class_colors[b.cls]) || "#0f0";
-        pCtx.font = ((S.label_size || 14) / pScale) + "px Arial";
-        pCtx.fillText((S.classes && S.classes[b.cls]) || String(b.cls), x1 + dx, Math.max(dy, y1 + dy - 4));
-      }
-    });
-  });
+  drawAllBoxes(pCtx, pScale, offs,
+    document.getElementById("cropPShowBoxes").checked, document.getElementById("cropPShowLabels").checked);
 }
 function fitCropPopup() {
   if (!pImg) return;
