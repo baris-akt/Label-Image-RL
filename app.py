@@ -135,6 +135,7 @@ observers = []
 OBS_COLORS = ["#ffff00", "#ff00ff", "#00ffff", "#00ff00", "#0000ff"]
 folder_image_list = []
 skip_obs_only = True
+obs_filter_id = None
 
 
 def class_name(cls_idx):
@@ -589,6 +590,9 @@ def apply_class_filter(keep_path=None):
         image_list = base
     else:
         image_list = [p for p in base if image_has_class(p, class_filter_id)]
+    if obs_filter_id is not None:
+        obs = next((o for o in observers if o["id"] == obs_filter_id), None)
+        image_list = [p for p in image_list if obs and obs["boxes"].get(p)]
     if size_filter_on and path_size_pct:
         lo = min(size_filter_lo, size_filter_hi)
         hi = max(size_filter_lo, size_filter_hi)
@@ -969,6 +973,7 @@ def state_payload():
         "observers": [{"id": o["id"], "name": o["name"], "dir": o["dir"], "color": o["color"],
                        "color2": o["color2"]} for o in observers],
         "skip_obs_only": skip_obs_only,
+        "obs_filter": obs_filter_id,
         "obs_boxes": [{"id": o["id"], "boxes": o["boxes"].get(path, [])} for o in observers] if path else [],
         "index": current_index,
         "total": len(image_list),
@@ -1037,13 +1042,14 @@ def api_image():
 
 
 def apply_folder(kind, d):
-    global IMAGES_DIR, LABELS_DIR, folder_busy
+    global IMAGES_DIR, LABELS_DIR, folder_busy, obs_filter_id
     folder_busy = True
     try:
         if kind == "images":
             IMAGES_DIR = d
             LABELS_DIR = ""
             observers.clear()
+            obs_filter_id = None
         else:
             LABELS_DIR = d
         reload_images()
@@ -1217,6 +1223,16 @@ def api_observed_add():
     return jsonify(state_payload())
 
 
+@app.route("/api/filter_observed", methods=["POST"])
+def api_filter_observed():
+    global obs_filter_id
+    keep = current_path()
+    oid = (request.get_json(force=True) or {}).get("id")
+    obs_filter_id = int(oid) if oid is not None and any(o["id"] == int(oid) for o in observers) else None
+    apply_class_filter(keep)
+    return jsonify(state_payload())
+
+
 @app.route("/api/observed/skip", methods=["POST"])
 def api_observed_skip():
     global skip_obs_only, crop_refs
@@ -1232,12 +1248,14 @@ def api_observed_skip():
 
 @app.route("/api/observed/remove", methods=["POST"])
 def api_observed_remove():
-    global crop_refs
+    global crop_refs, obs_filter_id
     err = busy_error()
     if err:
         return jsonify({"error": err}), 409
     oid = (request.get_json(force=True) or {}).get("id")
     observers[:] = [o for o in observers if o["id"] != oid]
+    if obs_filter_id == oid:
+        obs_filter_id = None
     if box_size_cache_ready:
         rebuild_visible_images()
     crop_refs = []

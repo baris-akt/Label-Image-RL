@@ -552,6 +552,11 @@ document.getElementById("classFilter").onchange = () => {
   document.getElementById("classFilter").blur();
   post("/api/filter_class", { cls: v === "" ? null : +v }).then(afterFilter);
 };
+document.getElementById("obsFilter").onchange = () => {
+  const v = document.getElementById("obsFilter").value;
+  document.getElementById("obsFilter").blur();
+  post("/api/filter_observed", { id: v === "" ? null : +v }).then(afterFilter);
+};
 document.getElementById("enableClassFilter").onchange = () => {
   const on = document.getElementById("enableClassFilter").checked;
   syncFilterBarForPage();
@@ -798,6 +803,11 @@ function renderObservers(st) {
     (obsHidden[o.id] ? "" : " checked") + " />" + escHtml(o.name) + "</label>"
   ).join("");
   ["obsToggles", "cropObsToggles"].forEach((id) => { document.getElementById(id).innerHTML = toggles; });
+  const of = document.getElementById("obsFilter");
+  of.innerHTML = "<option value=''>All Images</option>" + obs.map((o) =>
+    "<option value='" + o.id + "'>Only " + escHtml(o.name) + "</option>").join("");
+  of.value = st && st.obs_filter != null ? String(st.obs_filter) : "";
+  document.getElementById("obsFilterWrap").classList.toggle("hidden", !obs.length);
   document.querySelectorAll("[data-obs-toggle]").forEach((c) => {
     c.onchange = () => {
       obsHidden[c.dataset.obsToggle] = !c.checked;
