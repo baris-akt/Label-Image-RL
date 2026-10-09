@@ -276,6 +276,7 @@ body.light .filter-panel {
   background: rgba(255,255,255,.32);
   border-color: rgba(0,0,0,.2);
 }
+.filter-panel { z-index: 2; }
 .filter-panel label { margin-right: 8px; }
 .status {
   padding: 4px 8px;

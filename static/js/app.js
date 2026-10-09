@@ -206,12 +206,12 @@ function syncCropClusterNav(st) {
   if (next) next.classList.toggle("hidden", !on);
 }
 function cropClusterStep(dir) {
-  if (!S || !S.dataset_clustered || !(S.clusters || []).length) return;
-  const n = S.clusters.length;
-  let ci = S.crop_cluster_id;
-  if (ci == null) ci = 0;
-  ci = (ci + dir + n) % n;
-  post("/api/crop_cluster", { cluster: ci }).then(afterFilter);
+  const list = (S && S.clusters) || [];
+  if (!S || !S.dataset_clustered || !list.length) return;
+  let pos = list.findIndex((c) => c.i === S.crop_cluster_id);
+  if (pos < 0) pos = dir > 0 ? -1 : 0;
+  pos = (pos + dir + list.length) % list.length;
+  post("/api/crop_cluster", { cluster: list[pos].i }).then(afterFilter);
 }
 
 function renderNav(st) {
@@ -712,7 +712,14 @@ document.getElementById("fitBtn").onclick = fit;
 document.getElementById("checkedBtn").onclick = () => post("/api/checked").then(applyState);
 let delConfirmOpen = false;
 function doDelete() {
-  post("/api/delete").then(applyState).catch((err) => showModal(err.message || String(err)));
+  const fromPopup = popupOpen();
+  post("/api/delete").then((st) => {
+    if (fromPopup) {
+      cropPopupDirty = true;
+      closeCropPopup();
+    }
+    applyState(st);
+  }).catch((err) => showModal(err.message || String(err)));
 }
 function closeDelConfirm() {
   delConfirmOpen = false;
@@ -730,12 +737,17 @@ function openDelConfirm() {
   document.getElementById("delYes").onclick = () => { closeDelConfirm(); doDelete(); };
   document.getElementById("delNo").onclick = closeDelConfirm;
 }
-document.getElementById("delBtn").onclick = () => {
+function askDelete() {
   if (!S || S.index < 0) return;
   if (document.getElementById("delWarnChk").checked) openDelConfirm();
   else doDelete();
-};
-document.getElementById("statsBtn").onclick = () => api("/api/stats").then((j) => showModal(j.text));
+}
+document.getElementById("delBtn").onclick = askDelete;
+document.getElementById("cropPDelBtn").onclick = askDelete;
+document.getElementById("statsBtn").onclick = () => api("/api/stats").then((j) => {
+  showModal("");
+  document.getElementById("modalText").innerHTML = j.html;
+});
 function parentDir(p) {
   if (!p) return "";
   const s = String(p).replace(/[\\/]+$/, "");
@@ -786,7 +798,7 @@ function saveSettings() {
     place_w: +document.getElementById("placeW").value,
     place_h: +document.getElementById("placeH").value,
     filter_params: S.filter_params,
-  }).then((st) => applyState(st, true));
+  }).then((st) => { applyState(st, true); if (popupOpen()) loadPopupImages(); });
 }
 ["boxTh", "labSz", "placeW", "placeH"].forEach((id) => document.getElementById(id).onchange = saveSettings);
 document.getElementById("trackChk").onchange = () => {
@@ -808,32 +820,50 @@ document.getElementById("darkChk").onchange = () => {
   document.body.classList.toggle("light", !document.getElementById("darkChk").checked);
 };
 
-function updateFilterPanel() {
-  const panel = document.getElementById("filterPanel");
-  const radios = document.getElementById("filterRadios");
-  const sliders = document.getElementById("filterSliders");
-  if (!activeFilters.length) { panel.classList.add("hidden"); selFilter = null; loadImages(true); return; }
-  panel.classList.remove("hidden");
+function fillFilterPanels() {
+  const panels = [
+    ["filterPanel", "filterRadios", "filterSliders", "fr"],
+    ["cropFilterPanel", "cropFilterRadios", "cropFilterSliders", "frp"],
+  ];
+  if (!activeFilters.length || !S) {
+    panels.forEach((row) => document.getElementById(row[0]).classList.add("hidden"));
+    return;
+  }
   if (activeFilters.indexOf(selFilter) < 0) selFilter = activeFilters[0];
-  radios.innerHTML = activeFilters.map((f) =>
-    "<label class='row'><input type='radio' name='fr' value='" + f + "'" + (f === selFilter ? " checked" : "") + " /> " + f + "</label>"
-  ).join("");
-  radios.querySelectorAll("input").forEach((el) => { el.onchange = () => { selFilter = el.value; updateFilterPanel(); }; });
   const p = S.filter_params[selFilter] || {};
   let html = "";
   if (selFilter === "gamma") html = sliderHtml("value", "Gamma", p.value, 0.1, 3, 0.01);
   if (selFilter === "clahe") html = sliderHtml("clip", "Clip", p.clip, 1, 40, 0.1) + sliderHtml("tile", "Tile", p.tile, 8, 256, 1);
   if (selFilter === "unsharp") html = sliderHtml("amount", "Amount", p.amount, 0.2, 4, 0.01) + sliderHtml("sigma", "Radius", p.sigma, 0.3, 5, 0.1);
   if (selFilter === "emboss") html = sliderHtml("strength", "Strength", p.strength, 0.2, 4, 0.01);
-  sliders.innerHTML = html;
-  sliders.querySelectorAll("input").forEach((el) => {
-    el.oninput = () => {
-      S.filter_params[selFilter][el.dataset.k] = +el.value;
-      el.nextElementSibling.textContent = (+el.value).toFixed(2);
-      saveSettings();
-    };
+  panels.forEach((row) => {
+    const panel = document.getElementById(row[0]);
+    const radios = document.getElementById(row[1]);
+    const sliders = document.getElementById(row[2]);
+    panel.classList.remove("hidden");
+    radios.innerHTML = activeFilters.map((f) =>
+      "<label class='row'><input type='radio' name='" + row[3] + "' value='" + f + "'" + (f === selFilter ? " checked" : "") + " /> " + f + "</label>"
+    ).join("");
+    radios.querySelectorAll("input").forEach((el) => { el.onchange = () => { selFilter = el.value; updateFilterPanel(); }; });
+    sliders.innerHTML = html;
+    sliders.querySelectorAll("input").forEach((el) => {
+      el.oninput = () => {
+        S.filter_params[selFilter][el.dataset.k] = +el.value;
+        const text = (+el.value).toFixed(2);
+        document.querySelectorAll(".filter-panel input[data-k='" + el.dataset.k + "']").forEach((other) => {
+          other.value = el.value;
+          if (other.nextElementSibling) other.nextElementSibling.textContent = text;
+        });
+        saveSettings();
+      };
+    });
   });
+}
+function updateFilterPanel() {
+  if (!activeFilters.length) selFilter = null;
+  fillFilterPanels();
   loadImages(true);
+  if (popupOpen()) loadPopupImages();
 }
 function sliderHtml(k, lab, v, a, b, step) {
   return "<label>" + lab + " <input type='range' min='" + a + "' max='" + b + "' step='" + step + "' value='" + v + "' data-k='" + k + "' /> <span>" + Number(v).toFixed(2) + "</span></label>";
@@ -880,14 +910,23 @@ document.getElementById("cropClusterNext") && (document.getElementById("cropClus
 
 const pCv = document.getElementById("cropPopupCv");
 const pCtx = pCv.getContext("2d");
-let pImg = null, pW = 0, pH = 0, pScale = 1, pOx = 0, pOy = 0;
+let pImg = null, pImgF = null, pW = 0, pH = 0, pScale = 1, pOx = 0, pOy = 0, pDual = null;
 let pPan = false, pLast = null;
+let cropPopupIdx = -1;
 
 function popupOpen() {
   return !document.getElementById("cropPopup").classList.contains("hidden");
 }
+function pViewSize() {
+  if (pDual === "h") return [pW * 2 + DUAL_GAP, pH];
+  if (pDual === "v") return [pW, pH * 2 + DUAL_GAP];
+  return [pW, pH];
+}
 function pToImg(mx, my) {
-  return [(mx - pOx) / pScale, (my - pOy) / pScale];
+  let x = (mx - pOx) / pScale, y = (my - pOy) / pScale;
+  if (pDual === "h" && x >= pW + DUAL_GAP / 2) x -= pW + DUAL_GAP;
+  if (pDual === "v" && y >= pH + DUAL_GAP / 2) y -= pH + DUAL_GAP;
+  return [x, y];
 }
 function drawCropPopup() {
   const r = pCv.getBoundingClientRect();
@@ -900,42 +939,68 @@ function drawCropPopup() {
   if (!pImg) return;
   pCtx.setTransform(pScale, 0, 0, pScale, pOx, pOy);
   pCtx.drawImage(pImg, 0, 0, pW, pH);
+  let ox2 = 0, oy2 = 0;
+  if (pImgF && pDual === "h") { ox2 = pW + DUAL_GAP; pCtx.drawImage(pImgF, ox2, 0, pW, pH); }
+  if (pImgF && pDual === "v") { oy2 = pH + DUAL_GAP; pCtx.drawImage(pImgF, 0, oy2, pW, pH); }
   if (!S) return;
   const showB = document.getElementById("cropPShowBoxes").checked;
   const showL = document.getElementById("cropPShowLabels").checked;
   const th = (S.box_thickness || 2) / pScale;
-  (S.boxes || []).forEach((b, i) => {
-    const [x1, y1, x2, y2] = xyxy(b);
-    if (showB) {
-      if (i === selected && mode === "edit") {
-        pCtx.setLineDash([]);
-        pCtx.strokeStyle = "#000";
-        pCtx.lineWidth = 5 / pScale;
-        pCtx.strokeRect(x1, y1, x2 - x1, y2 - y1);
-        pCtx.strokeStyle = "#fff";
-        pCtx.lineWidth = 2 / pScale;
-        pCtx.strokeRect(x1, y1, x2 - x1, y2 - y1);
-      } else {
-        pCtx.strokeStyle = (S.class_colors && S.class_colors[b.cls]) || "#0f0";
-        pCtx.lineWidth = th;
-        pCtx.strokeRect(x1, y1, x2 - x1, y2 - y1);
+  const offs = [[0, 0]];
+  if (pImgF && pDual) offs.push([ox2, oy2]);
+  offs.forEach(([dx, dy]) => {
+    (S.boxes || []).forEach((b, i) => {
+      const [x1, y1, x2, y2] = xyxy(b);
+      if (showB) {
+        if (i === selected && mode === "edit") {
+          pCtx.setLineDash([]);
+          pCtx.strokeStyle = "#000";
+          pCtx.lineWidth = 5 / pScale;
+          pCtx.strokeRect(x1 + dx, y1 + dy, x2 - x1, y2 - y1);
+          pCtx.strokeStyle = "#fff";
+          pCtx.lineWidth = 2 / pScale;
+          pCtx.strokeRect(x1 + dx, y1 + dy, x2 - x1, y2 - y1);
+        } else {
+          pCtx.strokeStyle = (S.class_colors && S.class_colors[b.cls]) || "#0f0";
+          pCtx.lineWidth = th;
+          pCtx.strokeRect(x1 + dx, y1 + dy, x2 - x1, y2 - y1);
+        }
       }
-    }
-    if (showL) {
-      pCtx.fillStyle = (S.class_colors && S.class_colors[b.cls]) || "#0f0";
-      pCtx.font = ((S.label_size || 14) / pScale) + "px Arial";
-      pCtx.fillText((S.classes && S.classes[b.cls]) || String(b.cls), x1, Math.max(0, y1 - 4));
-    }
+      if (showL) {
+        pCtx.fillStyle = (S.class_colors && S.class_colors[b.cls]) || "#0f0";
+        pCtx.font = ((S.label_size || 14) / pScale) + "px Arial";
+        pCtx.fillText((S.classes && S.classes[b.cls]) || String(b.cls), x1 + dx, Math.max(dy, y1 + dy - 4));
+      }
+    });
   });
 }
 function fitCropPopup() {
   if (!pImg) return;
   const r = pCv.getBoundingClientRect();
   pCv.width = r.width; pCv.height = r.height;
-  pScale = Math.min(r.width / pW, r.height / pH);
-  pOx = (r.width - pW * pScale) / 2;
-  pOy = (r.height - pH * pScale) / 2;
+  const [vw, vh] = pViewSize();
+  pScale = Math.min(r.width / vw, r.height / vh);
+  pOx = (r.width - vw * pScale) / 2;
+  pOy = (r.height - vh * pScale) / 2;
   drawCropPopup();
+}
+function loadPopupImages() {
+  if (!popupOpen() || cropPopupIdx < 0) return;
+  const src = "/api/crop_image/" + cropPopupIdx + "?g=" + cropGen + "&t=" + Date.now();
+  pDual = selFilter ? (pW >= pH ? "v" : "h") : null;
+  const a = new Image();
+  a.onload = () => {
+    pImg = a; pW = a.naturalWidth; pH = a.naturalHeight;
+    imgW = pW; imgH = pH;
+    pDual = selFilter ? (pW >= pH ? "v" : "h") : null;
+    fitCropPopup();
+  };
+  a.src = src;
+  if (selFilter) {
+    const b = new Image();
+    b.onload = () => { pImgF = b; drawCropPopup(); };
+    b.src = src + "&filter=" + encodeURIComponent(selFilter);
+  } else pImgF = null;
 }
 function openCropPopup(it) {
   cropPopupDirty = false;
@@ -954,13 +1019,10 @@ function openCropPopup(it) {
       (it.name || "") + "  |  " + (it.cls_name || "") + "  |  E edit  R remove  Q place  B boxes  L labels";
     pImg = null;
     document.getElementById("cropPopup").classList.remove("hidden");
-    const a = new Image();
-    a.onload = () => {
-      pImg = a; pW = a.naturalWidth; pH = a.naturalHeight;
-      imgW = pW; imgH = pH;
-      fitCropPopup();
-    };
-    a.src = "/api/crop_image/" + it.i + "?g=" + cropGen + "&t=" + Date.now();
+    cropPopupIdx = it.i;
+    pImg = null; pImgF = null;
+    fillFilterPanels();
+    loadPopupImages();
   });
 }
 function closeCropPopup() {
@@ -969,7 +1031,7 @@ function closeCropPopup() {
   const scroll = grid ? grid.scrollTop : 0;
   const hint = cropFocusHint;
   document.getElementById("cropPopup").classList.add("hidden");
-  pImg = null; pPan = false; pLast = null; drag = null;
+  pImg = null; pImgF = null; pDual = null; cropPopupIdx = -1; pPan = false; pLast = null; drag = null;
   if (was && isCropPage() && cropPopupDirty) {
     resetAndLoadCrops(cropShowCount(), { keepScroll: scroll, focusHint: hint, quiet: true });
   }
@@ -983,7 +1045,8 @@ pCv.addEventListener("wheel", (e) => {
   e.preventDefault();
   if (!pImg) return;
   const r = pCv.getBoundingClientRect();
-  const fitS = Math.min(r.width / pW, r.height / pH);
+  const [vw, vh] = pViewSize();
+  const fitS = Math.min(r.width / vw, r.height / vh);
   const minS = fitS * 0.2;
   const maxS = Math.max(fitS * 50, 40);
   let dy = e.deltaY;
@@ -1224,8 +1287,8 @@ window.addEventListener("keydown", (e) => {
     e.preventDefault(); document.getElementById("nextBtn").click();
   }
   if (k === "delete") {
-    if (popupOpen()) return;
-    e.preventDefault(); document.getElementById("delBtn").click();
+    e.preventDefault();
+    (popupOpen() ? document.getElementById("cropPDelBtn") : document.getElementById("delBtn")).click();
   }
 });
 

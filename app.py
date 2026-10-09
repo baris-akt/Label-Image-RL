@@ -9,6 +9,8 @@ or paste a folder path and press Set.
 """
 import os
 import io
+import re
+import html
 import sys
 import json
 import threading
@@ -58,10 +60,14 @@ IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
 PLACE_W, PLACE_H = 50, 50
 BOX_THICKNESS, LABEL_SIZE = 2, 10
 UNDO_MAX = 10
-CLUSTER_RADIUS = 8.0
-PHASH_SIZE = 16
+CLUSTER_CROP = 224
+CLUSTER_MAX_BITS = 14
+CLUSTER_MERGE_BITS = 14
+CLUSTER_ATTACH_BITS = 22
+CLUSTER_SMALL = 2
+PHASH_SIZE = 8
 PHASH_BITS = PHASH_SIZE * PHASH_SIZE
-FEATURE_DIM = PHASH_BITS + 256
+FEATURE_DIM = PHASH_BITS
 CLUSTER_WORKERS = max(2, min((os.cpu_count() or 8) - 5, 12))
 CROP_ZOOM = 3.0
 CROP_SMALL_FRAC = 0.07
@@ -84,6 +90,9 @@ images_no_txt = 0
 images_empty_txt = 0
 images_scanned = 0
 folder_busy = False
+base_boxes = {}
+touched_paths = set()
+deleted_paths = set()
 class_filter_id = None
 sort_mode = "name"
 size_filter_on = False
@@ -105,6 +114,7 @@ index_msg = ""
 index_error = ""
 INDEX_WORKERS = max(4, (os.cpu_count() or 8) - 5)
 dataset_clustered = False
+box_cluster = {}
 cluster_groups = []
 cluster_ordered_paths = []
 clustering = False
@@ -202,11 +212,9 @@ def drop_from_lists(path):
     if box_size_cache_ready:
         rebuild_size_order()
     if dataset_clustered:
-        cluster_groups = [[p for p in g if p != path] for g in cluster_groups]
-        cluster_groups = [g for g in cluster_groups if g]
-        cluster_ordered_paths = [p for g in cluster_groups for p in g]
-        if not cluster_groups:
-            dataset_clustered = False
+        for k in [k for k in box_cluster if k[0] == path]:
+            del box_cluster[k]
+        rebuild_cluster_order()
     crop_refs = []
     if not image_list:
         current_index = -1
@@ -221,9 +229,26 @@ def write_boxes(path, boxes):
         for b in boxes:
             f.write("%d %.6f %.6f %.6f %.6f\n" % (b["cls"], b["cx"], b["cy"], b["w"], b["h"]))
     crop_refs = []
+    touched_paths.add(path)
     if not boxes:
         drop_from_lists(path)
         return
+    if dataset_clustered:
+        old_ci = {k[1]: box_cluster.pop(k) for k in [k for k in box_cluster if k[0] == path]}
+        fallback = next(iter(old_ci.values()), None)
+        left_new = []
+        for b in boxes:
+            nk = box_key(b)
+            if nk in old_ci:
+                box_cluster[(path, nk)] = old_ci.pop(nk)
+            else:
+                left_new.append(nk)
+        left_old = list(old_ci.values())
+        for nk in left_new:
+            ci = left_old.pop(0) if left_old else fallback
+            if ci is not None:
+                box_cluster[(path, nk)] = ci
+        rebuild_cluster_order()
     if box_size_cache_ready:
         cache_boxes_for_path(path, boxes)
         path_classes[path] = {int(b["cls"]) for b in boxes}
@@ -415,6 +440,11 @@ def start_dataset_index():
             images_no_txt = no_txt
             images_empty_txt = empty_txt
             all_image_list = [p for p in paths if box_size_cache.get(p)]
+            base_boxes.clear()
+            for p in all_image_list:
+                base_boxes[p] = [box_key(b) for b in box_size_cache[p]]
+            touched_paths.clear()
+            deleted_paths.clear()
             rebuild_size_order()
             box_size_cache_ready = True
             apply_class_filter()
@@ -465,6 +495,57 @@ def apply_class_filter(keep_path=None):
         current_index = min(max(0, current_index), len(image_list) - 1)
     else:
         current_index = -1
+    snap_crop_cluster()
+
+
+def rebuild_cluster_order():
+    global cluster_groups, cluster_ordered_paths, dataset_clustered
+    n = (max(box_cluster.values()) + 1) if box_cluster else 0
+    groups = [[] for _ in range(n)]
+    for k, ci in box_cluster.items():
+        groups[ci].append(k)
+    cluster_groups = groups
+    seen = set()
+    order = []
+    for g in groups:
+        for p, _ in g:
+            if p not in seen:
+                seen.add(p)
+                order.append(p)
+    order += [p for p in all_image_list if p not in seen]
+    cluster_ordered_paths = order
+    dataset_clustered = bool(box_cluster)
+
+
+def visible_clusters():
+    shown = set(image_list)
+    counts = [0] * len(cluster_groups)
+    for (p, k), ci in box_cluster.items():
+        if p in shown and (class_filter_id is None or k[0] == int(class_filter_id)):
+            counts[ci] += 1
+    return [{"i": i, "n": n} for i, n in enumerate(counts) if n]
+
+
+def first_image_of_cluster(ci):
+    allow = {p for p, _ in cluster_groups[ci]}
+    for i, p in enumerate(image_list):
+        if p in allow:
+            return i
+    return None
+
+
+def snap_crop_cluster():
+    global crop_cluster_id
+    if crop_cluster_id is None or sort_mode != "cluster" or not cluster_groups:
+        return
+    vis = [c["i"] for c in visible_clusters()]
+    if not vis:
+        crop_cluster_id = None
+        return
+    if crop_cluster_id in vis:
+        return
+    later = [i for i in vis if i > crop_cluster_id]
+    crop_cluster_id = later[0] if later else vis[0]
 
 
 def current_path():
@@ -523,18 +604,24 @@ def encode_jpg(bgr, quality=90):
     return io.BytesIO(buf.tobytes()) if ok else io.BytesIO()
 
 
-def extract_phash_feature(path):
-    try:
-        with Image.open(path) as im:
-            img = im.convert("RGB")
-            ph = imagehash.phash(img, hash_size=PHASH_SIZE)
-            ph_bits = np.asarray(ph.hash, dtype=np.float32).flatten()
-            gray = img.resize((64, 64)).convert("L")
-            hist = np.asarray(gray.histogram(), dtype=np.float32)
-        hist /= (hist.sum() + 1e-6)
-        return np.concatenate([ph_bits, hist]).astype(np.float32)
-    except Exception:
-        return None
+def extract_box_features(job):
+    path, boxes = job
+    bgr = load_bgr(path)
+    h, w = bgr.shape[:2]
+    half = CLUSTER_CROP // 2
+    out = []
+    for b in boxes:
+        cx = min(max(int(round(float(b["cx"]) * w)), 0), w - 1)
+        cy = min(max(int(round(float(b["cy"]) * h)), 0), h - 1)
+        x1, y1 = cx - half, cy - half
+        x2, y2 = x1 + CLUSTER_CROP, y1 + CLUSTER_CROP
+        crop = bgr[max(0, y1):min(h, y2), max(0, x1):min(w, x2)]
+        crop = cv2.copyMakeBorder(crop, max(0, -y1), max(0, y2 - h), max(0, -x1), max(0, x2 - w),
+                                  cv2.BORDER_REPLICATE)
+        gray = cv2.equalizeHist(cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY))
+        ph = imagehash.phash(Image.fromarray(gray), hash_size=PHASH_SIZE)
+        out.append(np.asarray(ph.hash, dtype=np.float32).flatten())
+    return out
 
 
 def track_key(path):
@@ -643,8 +730,12 @@ def reload_images():
     images_no_txt = 0
     images_empty_txt = 0
     images_scanned = 0
+    base_boxes.clear()
+    touched_paths.clear()
+    deleted_paths.clear()
     undo_stack = []
     dataset_clustered = False
+    box_cluster.clear()
     cluster_groups = []
     cluster_ordered_paths = []
     size_filter_on = False
@@ -666,12 +757,8 @@ def ensure_crop_refs():
     if need_area and not box_size_cache_ready:
         build_size_ranks()
     paths = list(image_list)
-    if sort_mode == "cluster" and dataset_clustered and crop_cluster_id is not None:
-        if 0 <= int(crop_cluster_id) < len(cluster_groups):
-            allow = set(cluster_groups[int(crop_cluster_id)])
-            paths = [p for p in paths if p in allow]
-        else:
-            paths = []
+    by_cluster = sort_mode == "cluster" and dataset_clustered
+    want_ci = int(crop_cluster_id) if (by_cluster and crop_cluster_id is not None) else None
     refs = []
     for path in paths:
         if box_size_cache_ready and path in box_size_cache:
@@ -681,11 +768,17 @@ def ensure_crop_refs():
         for bi, b in boxes:
             if class_filter_id is not None and int(b["cls"]) != int(class_filter_id):
                 continue
+            ci = box_cluster.get((path, box_key(b))) if by_cluster else None
+            if want_ci is not None and ci != want_ci:
+                continue
             area = b.get("area")
             if need_area and area is None:
                 area = box_pixel_area(path, b)
-            refs.append({"path": path, "box": b, "box_i": bi, "area": area if area is not None else 0.0})
-    if sort_mode == "size_desc":
+            refs.append({"path": path, "box": b, "box_i": bi, "area": area if area is not None else 0.0,
+                         "ci": ci if ci is not None else 10 ** 9})
+    if by_cluster:
+        refs.sort(key=lambda r: r["ci"])
+    elif sort_mode == "size_desc":
         refs.sort(key=lambda r: r["area"], reverse=True)
     elif sort_mode == "size_asc":
         refs.sort(key=lambda r: r["area"])
@@ -789,7 +882,7 @@ def state_payload():
         "index_error": index_error,
         "dataset_clustered": dataset_clustered,
         "cluster_count": len(cluster_groups),
-        "clusters": [{"i": i, "n": len(g)} for i, g in enumerate(cluster_groups)],
+        "clusters": visible_clusters(),
         "clustering": clustering,
         "cluster_msg": cluster_msg,
         "cluster_pct": cluster_pct,
@@ -1006,11 +1099,14 @@ def api_goto():
     data = request.get_json(force=True) or {}
     if "cluster" in data and dataset_clustered:
         ci = int(data["cluster"])
+        vis = [c["i"] for c in visible_clusters()]
+        if vis and ci not in vis:
+            later = [i for i in vis if i > ci]
+            ci = later[0] if later else vis[0]
         if 0 <= ci < len(cluster_groups):
-            for p in cluster_groups[ci]:
-                if p in image_list:
-                    current_index = image_list.index(p)
-                    break
+            i = first_image_of_cluster(ci)
+            if i is not None:
+                current_index = i
     elif "index" in data and image_list:
         current_index = max(0, min(len(image_list) - 1, int(data["index"])))
     return jsonify(state_payload())
@@ -1058,6 +1154,8 @@ def api_delete():
     except OSError as e:
         return jsonify({"error": str(e)}), 400
     drop_from_lists(path)
+    deleted_paths.add(path)
+    touched_paths.add(path)
     if tracking_enabled:
         track_status.pop(track_key(path), None)
         save_tracking_json()
@@ -1142,12 +1240,15 @@ def api_crop_cluster():
     ci = int(data["cluster"])
     if ci < 0 or ci >= len(cluster_groups):
         return jsonify({"error": "Invalid cluster"}), 400
+    vis = [c["i"] for c in visible_clusters()]
+    if vis and ci not in vis:
+        later = [i for i in vis if i > ci]
+        ci = later[0] if later else vis[0]
     crop_cluster_id = ci
     crop_refs = []
-    for p in cluster_groups[ci]:
-        if p in image_list:
-            current_index = image_list.index(p)
-            break
+    i = first_image_of_cluster(ci)
+    if i is not None:
+        current_index = i
     return jsonify(state_payload())
 
 
@@ -1158,42 +1259,75 @@ def api_cluster():
         return jsonify(state_payload())
     clustering = True
     cluster_pct = 0.0
-    cluster_msg = "Clustering dataset... extracting features"
-    paths = list(all_image_list)
+    cluster_msg = "Clustering dataset... extracting box features"
+    jobs = [(p, box_size_cache.get(p) or load_boxes(p)) for p in all_image_list]
 
     def work():
-        global clustering, dataset_clustered, cluster_groups, cluster_ordered_paths, cluster_msg, crop_refs, cluster_pct
+        global clustering, cluster_msg, crop_refs, cluster_pct
         try:
-            n = len(paths)
-            feats = np.zeros((n, FEATURE_DIM), dtype=np.float32)
+            keys = []
+            feats = []
+            n_img = len(jobs)
             with ThreadPoolExecutor(max_workers=max(1, CLUSTER_WORKERS)) as pool:
-                for i, feat in enumerate(pool.map(extract_phash_feature, paths)):
-                    if feat is not None:
-                        feats[i] = feat
-                    cluster_pct = 70.0 * (i + 1) / float(n)
-                    cluster_msg = "Extracting features... %d / %d" % (i + 1, n)
+                for i, (job, fl) in enumerate(zip(jobs, pool.map(extract_box_features, jobs))):
+                    for b, f in zip(job[1], fl):
+                        keys.append((job[0], box_key(b)))
+                        feats.append(f)
+                    cluster_pct = 70.0 * (i + 1) / float(n_img)
+                    cluster_msg = "Extracting box features... %d / %d images" % (i + 1, n_img)
+            n = len(keys)
+            feats = np.array(feats, dtype=np.float32).reshape(n, FEATURE_DIM)
             assigned = np.zeros(n, dtype=bool)
             groups = []
-            r2 = CLUSTER_RADIUS * CLUSTER_RADIUS
-            cluster_msg = "Grouping similar images..."
+            cluster_msg = "Grouping similar boxes..."
             for seed in range(n):
                 if assigned[seed]:
                     continue
-                diff = feats - feats[seed]
-                d2 = np.einsum("ij,ij->i", diff, diff)
-                d2[assigned] = np.inf
-                members = np.nonzero(d2 <= r2)[0]
+                d = np.abs(feats - feats[seed]).sum(axis=1)
+                d[assigned] = np.inf
+                members = np.nonzero(d <= CLUSTER_MAX_BITS)[0]
                 assigned[members] = True
-                groups.append([paths[j] for j in members.tolist()])
-                cluster_pct = 70.0 + 30.0 * float(assigned.sum()) / float(n)
-                cluster_msg = "Grouping similar images... %d / %d" % (int(assigned.sum()), n)
+                groups.append(members.tolist())
+                cluster_pct = 70.0 + 25.0 * float(assigned.sum()) / float(n)
+                cluster_msg = "Grouping similar boxes... %d / %d" % (int(assigned.sum()), n)
+            cluster_msg = "Merging similar clusters..."
             groups = sorted(groups, key=len, reverse=True)
-            cluster_groups = groups
-            cluster_ordered_paths = [p for g in groups for p in g]
-            dataset_clustered = True
+            cents = np.array([feats[g].mean(axis=0) for g in groups], dtype=np.float32).reshape(-1, FEATURE_DIM)
+            k = len(groups)
+            owner = np.arange(k)
+            merged = np.zeros(k, dtype=bool)
+            for a in range(k):
+                if merged[a]:
+                    continue
+                d = np.abs(cents - cents[a]).sum(axis=1)
+                d[merged] = np.inf
+                d[a] = np.inf
+                near = np.nonzero(d <= CLUSTER_MERGE_BITS)[0]
+                owner[near] = a
+                merged[near] = True
+            sizes = np.zeros(k, dtype=np.int64)
+            for a in range(k):
+                sizes[owner[a]] += len(groups[a])
+            big = np.nonzero((~merged) & (sizes > CLUSTER_SMALL))[0]
+            if len(big):
+                for a in np.nonzero((~merged) & (sizes <= CLUSTER_SMALL))[0]:
+                    d = np.abs(cents[big] - cents[a]).sum(axis=1)
+                    j = int(np.argmin(d))
+                    if d[j] <= CLUSTER_ATTACH_BITS:
+                        owner[owner == a] = big[j]
+            final = {}
+            for a in range(k):
+                final.setdefault(int(owner[a]), []).extend(groups[a])
+            groups = sorted(final.values(), key=len, reverse=True)
+            box_cluster.clear()
+            for ci, g in enumerate(groups):
+                for j in g:
+                    box_cluster[keys[j]] = ci
+            rebuild_cluster_order()
+            apply_class_filter(current_path())
             crop_refs = []
             cluster_pct = 100.0
-            cluster_msg = "Clustered into %d groups" % len(groups)
+            cluster_msg = "Clustered %d boxes into %d groups" % (n, len(groups))
         except Exception as e:
             cluster_msg = str(e)
             cluster_pct = 0.0
@@ -1261,6 +1395,35 @@ def api_checked():
     return jsonify(state_payload())
 
 
+def box_key(b):
+    return (int(b["cls"]), round(float(b["cx"]), 6), round(float(b["cy"]), 6),
+            round(float(b["w"]), 6), round(float(b["h"]), 6))
+
+
+def diff_boxes(old, new, edited, deleted, added):
+    rest_new = list(new)
+    rest_old = []
+    for k in old:
+        if k in rest_new:
+            rest_new.remove(k)
+        else:
+            rest_old.append(k)
+    for k in list(rest_old):
+        same = [n for n in rest_new if n[0] == k[0]]
+        if same:
+            rest_new.remove(same[0])
+            rest_old.remove(k)
+            edited[k[0]] = edited.get(k[0], 0) + 1
+    while rest_old and rest_new:
+        rest_old.pop(0)
+        n = rest_new.pop(0)
+        edited[n[0]] = edited.get(n[0], 0) + 1
+    for k in rest_old:
+        deleted[k[0]] = deleted.get(k[0], 0) + 1
+    for n in rest_new:
+        added[n[0]] = added.get(n[0], 0) + 1
+
+
 @app.route("/api/stats")
 def api_stats():
     counts = [0] * len(CLASS_NAMES)
@@ -1271,23 +1434,56 @@ def api_stats():
             i = int(b["cls"])
             if 0 <= i < len(counts):
                 counts[i] += 1
+    tracked = bool(images_scanned and touched_paths)
+    edited, deleted, added = {}, {}, {}
+    edited_imgs = 0
+    for p in touched_paths:
+        if p not in base_boxes:
+            continue
+        if p in deleted_paths:
+            new = []
+        else:
+            new = [box_key(b) for b in box_size_cache.get(p, [])]
+        if p not in deleted_paths and sorted(new) != sorted(base_boxes[p]):
+            edited_imgs += 1
+        diff_boxes(base_boxes[p], new, edited, deleted, added)
+    n_del_imgs = len(deleted_paths)
+
+    def parts(items):
+        shown = [(n, label, color) for n, label, color in items if n]
+        if not tracked or not shown:
+            return ""
+        return "  -->  " + ", ".join("<span style='color:%s'>%d %s</span>" % (color, n, label)
+                                     for n, label, color in shown)
+
+    def chg(c=None):
+        if c is None:
+            e, d, a = sum(edited.values()), sum(deleted.values()), sum(added.values())
+        else:
+            e, d, a = edited.get(c, 0), deleted.get(c, 0), added.get(c, 0)
+        return parts([(e, "edited box", "#f5c542"), (d, "deleted box", "#ff5c5c"), (a, "added box", "#4cd964")])
+
     lines = []
     if images_scanned:
+        folder_now = images_scanned - n_del_imgs
+        with_boxes = len(all_image_list)
+        img_chg = parts([(edited_imgs, "edited image", "#f5c542"), (n_del_imgs, "deleted image", "#ff5c5c")])
         lines += [
-            "Images in folder: %d" % images_scanned,
-            "Images with boxes: %d" % (images_scanned - images_no_txt - images_empty_txt),
+            "Images in folder: %d%s" % (folder_now, img_chg),
+            "Images with boxes: %d" % with_boxes,
             "Images with no txt: %d" % images_no_txt,
-            "Images with empty txt (no boxes): %d" % images_empty_txt,
+            "Images with empty txt (no boxes): %d" % (folder_now - images_no_txt - with_boxes),
             "",
         ]
     lines += [
-        "Images shown: %d" % len(image_list),
-        "Total boxes: %d" % n_box,
+        "Images shown: %d%s" % (len(image_list), parts([(n_del_imgs, "deleted", "#ff5c5c")])),
+        "Total boxes: %d%s" % (n_box, chg()),
         "",
     ]
     for i, n in enumerate(counts):
-        lines.append("%d %s: %d" % (i, class_name(i), n))
-    return jsonify({"text": "\n".join(lines)})
+        lines.append("%d %s: %d%s" % (i, html.escape(class_name(i)), n, chg(i)))
+    out = "\n".join(lines)
+    return jsonify({"html": out, "text": re.sub(r"<[^>]+>", "", out)})
 
 
 @app.route("/api/crops")
@@ -1340,7 +1536,11 @@ def api_crop_image(idx):
         return ("stale", 409)
     if idx < 0 or idx >= len(crop_refs):
         return ("", 404)
-    return crop_jpg_response(load_bgr(crop_refs[idx]["path"]), 90)
+    bgr = load_bgr(crop_refs[idx]["path"])
+    filt = request.args.get("filter")
+    if filt:
+        bgr = apply_filter(bgr, filt)
+    return crop_jpg_response(bgr, 90)
 
 
 @app.route("/api/open_crop", methods=["POST"])
